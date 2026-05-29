@@ -129,7 +129,7 @@ impl SamplingConfig {
     /// Create config tuned for the given problem size.
     /// Reduces sample count for expensive LPs (high demand count).
     pub fn for_problem(_n_operators: usize, n_demands: usize) -> Self {
-        let (base, cap) = if n_demands > 2000 { (80, 300) } else { (100, 500) };
+        let (base, cap) = if n_demands > 2000 { (40, 150) } else { (50, 300) };
         Self {
             min_samples: base,
             max_samples: cap,
@@ -459,12 +459,22 @@ impl Shapley {
 
             // ── Pass 2: Solve new coalitions in parallel (rayon) ────
             let new_masks: Vec<u32> = needed_masks.into_iter().collect();
+            let new_count = new_masks.len();
+            let cached_count = coalition_cache.len();
+            eprintln!(
+                "[shapley] batch {}: {} perms, {} new coalitions to solve ({} cached)",
+                total_samples / batch.max(1) + 1,
+                batch,
+                new_count,
+                cached_count,
+            );
 
             thread_local! {
                 static SAMP_BUFFERS: RefCell<Option<CoalitionBuffers>> =
                     const { RefCell::new(None) };
             }
 
+            let solve_start = std::time::Instant::now();
             let new_values: Vec<(u32, Option<f64>)> = new_masks
                 .par_iter()
                 .map(|&mask| {
@@ -500,6 +510,18 @@ impl Shapley {
             for (mask, val) in new_values {
                 coalition_cache.insert(mask, val);
             }
+            let solve_elapsed = solve_start.elapsed();
+            eprintln!(
+                "[shapley] batch {} solved {} coalitions in {:.1}s ({:.0}ms/lp)",
+                total_samples / batch.max(1) + 1,
+                new_count,
+                solve_elapsed.as_secs_f64(),
+                if new_count > 0 {
+                    solve_elapsed.as_millis() as f64 / new_count as f64
+                } else {
+                    0.0
+                },
+            );
 
             // ── Pass 3: Compute marginal contributions ──────────────
             for perm in &batch_perms {
@@ -867,11 +889,11 @@ mod tests {
     #[test]
     fn test_sampling_config_for_problem() {
         let config = SamplingConfig::for_problem(14, 1148);
-        assert_eq!(config.min_samples, 100);
-        assert_eq!(config.max_samples, 500);
+        assert_eq!(config.min_samples, 50);
+        assert_eq!(config.max_samples, 300);
 
         let config_heavy = SamplingConfig::for_problem(14, 3000);
-        assert_eq!(config_heavy.min_samples, 80);
-        assert_eq!(config_heavy.max_samples, 300);
+        assert_eq!(config_heavy.min_samples, 40);
+        assert_eq!(config_heavy.max_samples, 150);
     }
 }
