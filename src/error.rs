@@ -30,4 +30,7 @@ pub enum ShapleyError {
 
     #[error("Matrix construction error: {0}")]
     MatrixConstructionError(String),
+
+    #[error("computation cancelled")]
+    Cancelled,
 }

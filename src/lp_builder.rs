@@ -188,6 +188,20 @@ impl<'a> LpBuilderInput<'a> {
 
         // Pad A_eq to match A_ub's new auxiliary columns
         let total_cols = n_links * n_commodities + n_multicast_groups * mcast_eligible.len();
+        // Decomposition of the LP size: columns ≈ consolidated-links × commodities
+        // (+ multicast aux). `commodities` is dominated by multicast demands —
+        // consolidate_demand() assigns a UNIQUE commodity type per multicast row —
+        // so this is the lever that determines the whole problem scale.
+        eprintln!(
+            "[shapley] LP build: {} nodes, {} consolidated-links, {} commodities \
+             ({} multicast groups, {} mcast-eligible links) -> {} cols (pre-keep)",
+            n_nodes,
+            n_links,
+            n_commodities,
+            n_multicast_groups,
+            mcast_eligible.len(),
+            total_cols,
+        );
         let a_eq_padded = if total_cols > a_eq.n {
             let padding = CscMatrix::new(
                 a_eq.m,

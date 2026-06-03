@@ -3,7 +3,6 @@ pub mod error;
 pub(crate) mod lp_builder;
 pub(crate) mod multicast;
 pub mod shapley;
-pub(crate) mod simplex;
 pub(crate) mod solver;
 pub(crate) mod sparse;
 pub mod types;
