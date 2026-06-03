@@ -2,8 +2,11 @@ use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Display, Formatter},
+    sync::Arc,
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use rand::Rng;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 #[cfg(feature = "serde")]
@@ -85,6 +88,148 @@ impl ShapleyInput {
         );
         shapley.compute_sampled(config)
     }
+
+    /// Compute sampled Shapley values, pre-populating the coalition cache.
+    ///
+    /// Coalitions already present in `existing_cache` won't be re-solved.
+    /// This is the key optimisation for simulation workflows: reuse
+    /// baseline coalition values and only solve coalitions affected by
+    /// topology changes.
+    pub fn compute_sampled_with_cache(
+        &self,
+        config: SamplingConfig,
+        existing_cache: HashMap<u32, Option<f64>>,
+    ) -> Result<SampledOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_sampled_with_cache(config, existing_cache)
+    }
+
+    /// Like [`Self::compute_sampled`] but cooperatively cancellable, and
+    /// reports live progress via `control` (drives a progress bar; set
+    /// `control.cancel` to stop early — returns [`ShapleyError::Cancelled`]).
+    pub fn compute_sampled_cancellable(
+        &self,
+        config: SamplingConfig,
+        control: &ComputeControl,
+    ) -> Result<SampledOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_sampled_cancellable(config, control)
+    }
+
+    /// Like [`Self::compute_sampled_with_cache`] but cooperatively cancellable
+    /// with live progress via `control`.
+    pub fn compute_sampled_with_cache_cancellable(
+        &self,
+        config: SamplingConfig,
+        existing_cache: HashMap<u32, Option<f64>>,
+        control: &ComputeControl,
+    ) -> Result<SampledOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_sampled_with_cache_cancellable(config, existing_cache, control)
+    }
+
+    /// Sampled Shapley with SOUND topology-aware reuse (B3). Seeds the coalition
+    /// cache from a baseline run on a *different* topology, but reuses a seeded
+    /// value only for coalitions that exclude every operator in
+    /// `changed_operators` (the operators owning a primitive that differs from
+    /// the seed's topology — the caller derives these from changed links'/devices'
+    /// endpoint operators). Coalitions touching a changed operator are re-solved,
+    /// so the result is identical to a full fresh recompute.
+    ///
+    /// SAFETY (caller-enforced): only call when the operator SET, `public_links`,
+    /// `demands`, `demand_multiplier`, `contiguity_bonus`, and `operator_uptime`
+    /// are unchanged vs the seed's topology — otherwise fall back to
+    /// [`Self::compute_sampled`]. Pass `changed_operators == []` only when the
+    /// topology is identical (equivalent to [`Self::compute_sampled_with_cache`]).
+    pub fn compute_sampled_with_reuse(
+        &self,
+        config: SamplingConfig,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: Vec<String>,
+    ) -> Result<SampledOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_sampled_with_reuse(config, seed_cache, &changed_operators)
+    }
+
+    /// Like [`Self::compute_sampled_with_reuse`] but cancellable with live
+    /// progress via `control`.
+    pub fn compute_sampled_with_reuse_cancellable(
+        &self,
+        config: SamplingConfig,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: Vec<String>,
+        control: &ComputeControl,
+    ) -> Result<SampledOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_sampled_with_reuse_cancellable(
+            config,
+            seed_cache,
+            &changed_operators,
+            control,
+        )
+    }
+
+    /// Exact Shapley with SOUND topology-aware reuse (B3, small-N path). Same
+    /// reuse rule as [`Self::compute_sampled_with_reuse`] but for the exact
+    /// `compute()` enumeration: a coalition's value is taken from `seed_cache`
+    /// when the coalition excludes every changed operator, else solved fresh.
+    /// Byte-identical to [`Self::compute`] on the modified topology.
+    pub fn compute_with_reuse(
+        &self,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: Vec<String>,
+    ) -> Result<ShapleyOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_inner(seed_cache, &changed_operators)
+    }
 }
 
 /// Individual Shapley value for an operator
@@ -129,11 +274,32 @@ impl SamplingConfig {
     /// Create config tuned for the given problem size.
     /// Reduces sample count for expensive LPs (high demand count).
     pub fn for_problem(_n_operators: usize, n_demands: usize) -> Self {
-        let (base, cap) = if n_demands > 2000 { (40, 150) } else { (50, 300) };
+        let (base, cap) = if n_demands > 2000 {
+            (40, 150)
+        } else {
+            (50, 300)
+        };
         Self {
             min_samples: base,
             max_samples: cap,
             ..Default::default()
+        }
+    }
+
+    /// Relaxed config for what-if simulations where directional accuracy
+    /// matters more than precision. Uses 10% target SE (vs 5% default)
+    /// and caps at 200 samples, yielding ~2–3× faster convergence.
+    pub fn for_simulation(_n_operators: usize, n_demands: usize) -> Self {
+        let (base, cap) = if n_demands > 2000 {
+            (30, 120)
+        } else {
+            (40, 200)
+        };
+        Self {
+            min_samples: base,
+            max_samples: cap,
+            target_se: 0.10,
+            batch_size: 50,
         }
     }
 }
@@ -149,6 +315,65 @@ pub struct SampledOutput {
     pub standard_errors: BTreeMap<String, f64>,
     /// Whether all operators converged within `target_se`.
     pub converged: bool,
+    /// Coalition value cache: maps coalition bitmask → LP objective value.
+    /// Can be reused across computations with the same network topology.
+    pub coalition_cache: HashMap<u32, Option<f64>>,
+    /// How many seeded coalition values were admitted + reused this run (the
+    /// gate-passing subset of a `compute_sampled_with_reuse` seed). 0 for a cold
+    /// run. `coalition_cache.len() - coalitions_reused` were solved fresh.
+    pub coalitions_reused: usize,
+}
+
+/// Cooperative cancellation + progress for a sampled compute.
+///
+/// Pass a shared `ComputeControl` into
+/// [`ShapleyInput::compute_sampled_cancellable`]: set `cancel` from another
+/// thread to stop early (the call returns [`ShapleyError::Cancelled`]), and
+/// read `progress` to drive a progress bar.
+#[derive(Debug, Default, Clone)]
+pub struct ComputeControl {
+    pub cancel: Arc<AtomicBool>,
+    pub progress: Arc<ComputeProgress>,
+}
+
+/// Live progress counters for a sampled compute (monotonically increasing).
+#[derive(Debug, Default)]
+pub struct ComputeProgress {
+    /// Coalition LPs solved so far across all batches.
+    pub coalitions_solved: AtomicUsize,
+    /// Permutation samples drawn so far. Advances only between batches, so on
+    /// its own it makes a coarse, step-shaped progress bar.
+    pub samples_done: AtomicUsize,
+    /// Configured sample cap (denominator for a rough progress fraction).
+    pub max_samples: AtomicUsize,
+    /// Number of samples in the IN-FLIGHT batch (`min_samples` for the first
+    /// batch, then `batch_size`). With the three batch fields below, a poller
+    /// can interpolate WITHIN a batch — `percent = (samples_done + batch_samples
+    /// · batch_solved/batch_total) / max_samples` — for a smooth, monotonic bar
+    /// that moves as each LP solves rather than jumping once per batch.
+    pub batch_samples: AtomicUsize,
+    /// Coalition LPs the in-flight batch must solve (known after its Pass 1).
+    /// 0 before Pass 1 completes; with B3 reuse this excludes reused coalitions,
+    /// so it reflects real work.
+    pub batch_total: AtomicUsize,
+    /// Coalition LPs solved so far WITHIN the in-flight batch (reset each batch).
+    pub batch_solved: AtomicUsize,
+}
+
+impl ComputeProgress {
+    /// Zero every counter. Used when a single [`ComputeControl`] is reused across
+    /// two sequential compute phases (e.g. baseline then modified) so the second
+    /// phase's progress starts at 0 instead of inheriting the first phase's final
+    /// counts. Relaxed stores are fine: a concurrent reader (the progress bridge)
+    /// only renders a fraction, never coordinates on these values.
+    pub fn reset(&self) {
+        self.coalitions_solved.store(0, Ordering::Relaxed);
+        self.samples_done.store(0, Ordering::Relaxed);
+        self.max_samples.store(0, Ordering::Relaxed);
+        self.batch_samples.store(0, Ordering::Relaxed);
+        self.batch_total.store(0, Ordering::Relaxed);
+        self.batch_solved.store(0, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -184,6 +409,19 @@ impl Shapley {
     }
 
     fn compute(&self) -> Result<ShapleyOutput> {
+        self.compute_inner(HashMap::new(), &[])
+    }
+
+    /// Exact compute with optional SOUND coalition reuse (B3). `seed_cache`
+    /// holds baseline coalition values (masks include `ALWAYS_BIT`); a coalition
+    /// is reused iff it excludes every operator in `changed_operators`, else
+    /// solved fresh. `seed_cache` empty + `changed_operators` empty == plain
+    /// `compute()`.
+    fn compute_inner(
+        &self,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: &[String],
+    ) -> Result<ShapleyOutput> {
         // Validate inputs
         check_inputs(
             &self.private_links,
@@ -241,6 +479,14 @@ impl Shapley {
             .map(|(i, op)| (op.as_str(), i as u8))
             .collect();
 
+        // B3 reuse gate (same rule as run_sampling): a coalition may take its
+        // value from `seed_cache` iff it excludes every changed operator. Empty
+        // when `changed_operators` is empty (no reuse).
+        let reuse_gate: u32 = changed_operators
+            .iter()
+            .filter_map(|op| op_index.get(op.as_str()).map(|&idx| 1u32 << idx))
+            .fold(0u32, |acc, b| acc | b);
+
         let operator_mask = |op: &str| -> u32 {
             if op == "Public" || op == "Private" || op.is_empty() {
                 ALWAYS_BIT
@@ -274,6 +520,14 @@ impl Shapley {
 
         let n_coalitions = 1 << n_operators;
         let n_cols = col_op1_mask.len();
+        eprintln!(
+            "[shapley] LP dims: {} cols, {} eq-rows, {} ub-rows; {} operators, {} coalitions (exact)",
+            n_cols,
+            primitives.b_eq.len(),
+            primitives.b_ub.len(),
+            n_operators,
+            n_coalitions,
+        );
 
         thread_local! {
             static BUFFERS: RefCell<Option<CoalitionBuffers>> = const { RefCell::new(None) };
@@ -283,11 +537,19 @@ impl Shapley {
         let coalition_values: Vec<Option<f64>> = (0..n_coalitions)
             .into_par_iter()
             .map(|coalition_idx| {
+                let coalition_mask = (coalition_idx as u32) | ALWAYS_BIT;
+
+                // B3 reuse: a coalition excluding every changed operator has an
+                // identical sub-LP (column gating), so its seeded value is exact.
+                if (coalition_idx as u32) & reuse_gate == 0
+                    && let Some(&seeded) = seed_cache.get(&coalition_mask)
+                {
+                    return seeded;
+                }
+
                 BUFFERS.with(|cell| {
                     let mut borrow = cell.borrow_mut();
                     let buf = borrow.get_or_insert_with(|| CoalitionBuffers::new(n_cols));
-
-                    let coalition_mask = (coalition_idx as u32) | ALWAYS_BIT;
 
                     match solve_coalition(
                         &primitives,
@@ -346,6 +608,59 @@ impl Shapley {
     }
 
     fn compute_sampled(&self, config: SamplingConfig) -> Result<SampledOutput> {
+        self.run_sampling(config, HashMap::new(), &[], None)
+    }
+
+    fn compute_sampled_cancellable(
+        &self,
+        config: SamplingConfig,
+        control: &ComputeControl,
+    ) -> Result<SampledOutput> {
+        self.run_sampling(config, HashMap::new(), &[], Some(control))
+    }
+
+    fn compute_sampled_with_reuse(
+        &self,
+        config: SamplingConfig,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: &[String],
+    ) -> Result<SampledOutput> {
+        self.run_sampling(config, seed_cache, changed_operators, None)
+    }
+
+    fn compute_sampled_with_reuse_cancellable(
+        &self,
+        config: SamplingConfig,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: &[String],
+        control: &ComputeControl,
+    ) -> Result<SampledOutput> {
+        self.run_sampling(config, seed_cache, changed_operators, Some(control))
+    }
+
+    /// Shared adaptive Monte-Carlo permutation sampler.
+    ///
+    /// `coalition_cache` seeds previously-solved coalition values (empty for a
+    /// cold run; populated by [`Shapley::compute_sampled_with_cache`]).
+    /// Coalitions already present are not re-solved, so callers MUST only seed
+    /// values that are valid for *this* topology.
+    ///
+    /// Honours `operator_uptime`. When uptime < 1.0 each sampled permutation
+    /// also draws an independent "up" mask (each operator up with probability
+    /// `operator_uptime`); the per-operator marginal is
+    /// `uptime * (v(U ∪ {i}) - v(U))` where `U` is the set of *up* predecessors.
+    /// This is an unbiased estimator of the same uptime-weighted Shapley value
+    /// the exact path produces via [`compute_expected_values`]:
+    ///   `E[v(S∪i) under uptime] - E[v(S) under uptime] = uptime · E_U[v(U∪i) - v(U)]`.
+    /// At uptime == 1.0 every operator is always up, so `up_prefix` is the full
+    /// permutation prefix and this reduces exactly to the plain marginal.
+    fn run_sampling(
+        &self,
+        config: SamplingConfig,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: &[String],
+        control: Option<&ComputeControl>,
+    ) -> Result<SampledOutput> {
         // ── Setup (identical to compute()) ──────────────────────────
         check_inputs(
             &self.private_links,
@@ -372,6 +687,8 @@ impl Shapley {
                 samples_used: 0,
                 standard_errors: BTreeMap::new(),
                 converged: true,
+                coalition_cache: HashMap::new(),
+                coalitions_reused: 0,
             });
         }
 
@@ -404,6 +721,31 @@ impl Shapley {
             .map(|(i, op)| (op.as_str(), i as u8))
             .collect();
 
+        // ── B3 selective reuse: admit only SOUND seed entries ───────────────
+        // `changed_operators` are the operators owning a primitive that differs
+        // between the seed's topology and this one (derived by the caller from
+        // COLUMN-side link/device endpoints only — never row tags). A cached
+        // coalition value is reusable iff the coalition excludes every changed
+        // operator: column gating (solver.rs) then guarantees its sub-LP — kept
+        // columns + costs + kept rows' surviving coefficients + all eq-rows — is
+        // byte-identical across the two topologies, so v(S) (and infeasibility)
+        // is unchanged. We map names→bits with THIS run's op_index (so a caller
+        // never has to know our sorted-bit assignment), and admit only the
+        // gate-passing subset: gated-out masks are simply absent, so the Pass-1
+        // `contains_key` check re-solves them and the Pass-3 reads never miss.
+        let reuse_gate: u32 = changed_operators
+            .iter()
+            .filter_map(|op| op_index.get(op.as_str()).map(|&idx| 1u32 << idx))
+            .fold(0u32, |acc, b| acc | b);
+        let mut coalition_cache: HashMap<u32, Option<f64>> =
+            HashMap::with_capacity(seed_cache.len());
+        for (mask, val) in seed_cache {
+            if mask & reuse_gate == 0 {
+                coalition_cache.insert(mask, val);
+            }
+        }
+        let coalitions_reused = coalition_cache.len();
+
         let operator_mask = |op: &str| -> u32 {
             if op == "Public" || op == "Private" || op.is_empty() {
                 ALWAYS_BIT
@@ -414,17 +756,57 @@ impl Shapley {
             }
         };
 
-        let col_op1_mask: Vec<u32> = primitives.col_op1.iter().map(|s| operator_mask(s)).collect();
-        let col_op2_mask: Vec<u32> = primitives.col_op2.iter().map(|s| operator_mask(s)).collect();
-        let row_op1_mask: Vec<u32> = primitives.row_op1.iter().map(|s| operator_mask(s)).collect();
-        let row_op2_mask: Vec<u32> = primitives.row_op2.iter().map(|s| operator_mask(s)).collect();
+        let col_op1_mask: Vec<u32> = primitives
+            .col_op1
+            .iter()
+            .map(|s| operator_mask(s))
+            .collect();
+        let col_op2_mask: Vec<u32> = primitives
+            .col_op2
+            .iter()
+            .map(|s| operator_mask(s))
+            .collect();
+        let row_op1_mask: Vec<u32> = primitives
+            .row_op1
+            .iter()
+            .map(|s| operator_mask(s))
+            .collect();
+        let row_op2_mask: Vec<u32> = primitives
+            .row_op2
+            .iter()
+            .map(|s| operator_mask(s))
+            .collect();
         let n_cols = col_op1_mask.len();
+        eprintln!(
+            "[shapley] LP dims: {} cols, {} eq-rows, {} ub-rows; {} operators (sampled)",
+            n_cols,
+            primitives.b_eq.len(),
+            primitives.b_ub.len(),
+            n,
+        );
+
+        if let Some(c) = control {
+            c.progress
+                .max_samples
+                .store(config.max_samples, Ordering::Relaxed);
+        }
 
         // ── Adaptive sampling loop ──────────────────────────────────
+        // `apply_uptime` switches on the Bernoulli active-set estimator; at
+        // uptime == 1.0 every operator is always up and `up_prefix` tracks the
+        // full permutation prefix (the original estimator).
+        let uptime = self.operator_uptime;
+        let apply_uptime = uptime < 1.0;
         let mut rng = rand::rng();
         let mut all_marginals: Vec<Vec<f64>> = Vec::new();
-        let mut coalition_cache: HashMap<u32, Option<f64>> = HashMap::new();
         let mut total_samples: usize = 0;
+
+        if !coalition_cache.is_empty() {
+            eprintln!(
+                "[shapley] starting with {} pre-cached coalitions",
+                coalition_cache.len(),
+            );
+        }
 
         loop {
             let batch = if total_samples == 0 {
@@ -433,33 +815,55 @@ impl Shapley {
                 config.batch_size
             };
 
-            // ── Pass 1: Generate permutations, collect needed masks ──
+            // Reset the in-flight-batch progress counters (batch_total is filled
+            // once Pass 1 has collected the unique masks for this batch).
+            if let Some(c) = control {
+                c.progress.batch_samples.store(batch, Ordering::Relaxed);
+                c.progress.batch_total.store(0, Ordering::Relaxed);
+                c.progress.batch_solved.store(0, Ordering::Relaxed);
+            }
+
+            // ── Pass 1: sample permutations (+ up-masks), collect needed masks ──
             let mut needed_masks: HashSet<u32> = HashSet::new();
-            let mut batch_perms: Vec<Vec<usize>> = Vec::with_capacity(batch);
+            let mut batch_perms: Vec<(Vec<usize>, Vec<bool>)> = Vec::with_capacity(batch);
 
             for _ in 0..batch {
                 let mut perm: Vec<usize> = (0..n).collect();
                 perm.shuffle(&mut rng);
 
-                let mut mask: u32 = 0;
-                // Empty coalition
-                let empty_full = mask | ALWAYS_BIT;
-                if !coalition_cache.contains_key(&empty_full) {
-                    needed_masks.insert(empty_full);
-                }
+                // Per-operator "up" draw (all-up when uptime >= 1.0).
+                let up: Vec<bool> = if apply_uptime {
+                    (0..n).map(|_| rng.random::<f64>() < uptime).collect()
+                } else {
+                    vec![true; n]
+                };
+
+                // Walk the permutation, accumulating the up-predecessor
+                // coalition `U` and collecting the masks `U` and `U ∪ {i}`.
+                let mut up_prefix: u32 = 0;
                 for &i in &perm {
-                    mask |= 1u32 << i;
-                    let full = mask | ALWAYS_BIT;
-                    if !coalition_cache.contains_key(&full) {
-                        needed_masks.insert(full);
+                    let u_full = up_prefix | ALWAYS_BIT;
+                    let ui_full = up_prefix | (1u32 << i) | ALWAYS_BIT;
+                    if !coalition_cache.contains_key(&u_full) {
+                        needed_masks.insert(u_full);
+                    }
+                    if !coalition_cache.contains_key(&ui_full) {
+                        needed_masks.insert(ui_full);
+                    }
+                    if up[i] {
+                        up_prefix |= 1u32 << i;
                     }
                 }
-                batch_perms.push(perm);
+                batch_perms.push((perm, up));
             }
 
             // ── Pass 2: Solve new coalitions in parallel (rayon) ────
             let new_masks: Vec<u32> = needed_masks.into_iter().collect();
             let new_count = new_masks.len();
+            // Publish this batch's solve target so a poller can interpolate.
+            if let Some(c) = control {
+                c.progress.batch_total.store(new_count, Ordering::Relaxed);
+            }
             let cached_count = coalition_cache.len();
             eprintln!(
                 "[shapley] batch {}: {} perms, {} new coalitions to solve ({} cached)",
@@ -478,10 +882,15 @@ impl Shapley {
             let new_values: Vec<(u32, Option<f64>)> = new_masks
                 .par_iter()
                 .map(|&mask| {
+                    // Cooperative cancellation: once flagged, drain the
+                    // remaining masks without solving (rayon has no clean
+                    // early-abort, so we make each remaining item cheap).
+                    if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
+                        return (mask, None);
+                    }
                     SAMP_BUFFERS.with(|cell| {
                         let mut borrow = cell.borrow_mut();
-                        let buf =
-                            borrow.get_or_insert_with(|| CoalitionBuffers::new(n_cols));
+                        let buf = borrow.get_or_insert_with(|| CoalitionBuffers::new(n_cols));
 
                         let val = match solve_coalition(
                             &primitives,
@@ -502,6 +911,10 @@ impl Shapley {
                             }
                             Err(_) => None,
                         };
+                        if let Some(c) = control {
+                            c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
+                            c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
+                        }
                         (mask, val)
                     })
                 })
@@ -524,18 +937,35 @@ impl Shapley {
             );
 
             // ── Pass 3: Compute marginal contributions ──────────────
-            for perm in &batch_perms {
+            // Replays the same up-mask walk and reads cached values. The
+            // `uptime` factor + up-predecessor coalition `U` implement the
+            // uptime-weighted marginal; at uptime == 1.0 this is `v(S∪i)-v(S)`.
+            for (perm, up) in &batch_perms {
                 let mut marginals = vec![0.0f64; n];
-                let mut mask: u32 = 0;
+                let mut up_prefix: u32 = 0;
                 for &i in perm {
-                    let v_before = coalition_cache[&(mask | ALWAYS_BIT)].unwrap_or(0.0);
-                    mask |= 1u32 << i;
-                    let v_with = coalition_cache[&(mask | ALWAYS_BIT)].unwrap_or(0.0);
-                    marginals[i] = v_with - v_before;
+                    let u_full = up_prefix | ALWAYS_BIT;
+                    let ui_full = up_prefix | (1u32 << i) | ALWAYS_BIT;
+                    let v_before = coalition_cache[&u_full].unwrap_or(0.0);
+                    let v_with = coalition_cache[&ui_full].unwrap_or(0.0);
+                    marginals[i] = uptime * (v_with - v_before);
+                    if up[i] {
+                        up_prefix |= 1u32 << i;
+                    }
                 }
                 all_marginals.push(marginals);
             }
             total_samples += batch;
+
+            // Publish progress + honour cancellation between batches.
+            if let Some(c) = control {
+                c.progress
+                    .samples_done
+                    .store(total_samples, Ordering::Relaxed);
+                if c.cancel.load(Ordering::Relaxed) {
+                    return Err(ShapleyError::Cancelled);
+                }
+            }
 
             // ── Check convergence ───────────────────────────────────
             if total_samples >= config.min_samples {
@@ -561,7 +991,13 @@ impl Shapley {
                             } else {
                                 0.0
                             };
-                            (op.clone(), ShapleyValue { value: means[i], proportion })
+                            (
+                                op.clone(),
+                                ShapleyValue {
+                                    value: means[i],
+                                    proportion,
+                                },
+                            )
                         })
                         .collect();
 
@@ -576,6 +1012,8 @@ impl Shapley {
                         samples_used: total_samples,
                         standard_errors,
                         converged,
+                        coalition_cache,
+                        coalitions_reused,
                     });
                 }
             }
@@ -587,7 +1025,36 @@ impl Shapley {
         }
 
         // Fallback (unreachable in practice)
-        Err(ShapleyError::LpSolver("sampling loop exited unexpectedly".to_string()))
+        Err(ShapleyError::LpSolver(
+            "sampling loop exited unexpectedly".to_string(),
+        ))
+    }
+
+    /// Like [`compute_sampled`] but seeds the coalition cache from
+    /// `existing_cache` so previously-solved coalitions are not re-solved.
+    ///
+    /// SAFETY: `existing_cache` must hold coalition values computed for the
+    /// SAME topology (same private_links / costs). Coalition masks key only by
+    /// operator membership, not topology, so seeding values from a different
+    /// topology silently reuses stale objectives. The simulate handler keys
+    /// its epoch cache by a topology hash to enforce this.
+    fn compute_sampled_with_cache(
+        &self,
+        config: SamplingConfig,
+        existing_cache: HashMap<u32, Option<f64>>,
+    ) -> Result<SampledOutput> {
+        // Whole-cache reuse (no changed operators) — caller guarantees the cache
+        // is for the SAME topology (see SAFETY note above).
+        self.run_sampling(config, existing_cache, &[], None)
+    }
+
+    fn compute_sampled_with_cache_cancellable(
+        &self,
+        config: SamplingConfig,
+        existing_cache: HashMap<u32, Option<f64>>,
+        control: &ComputeControl,
+    ) -> Result<SampledOutput> {
+        self.run_sampling(config, existing_cache, &[], Some(control))
     }
 }
 
@@ -792,7 +1259,15 @@ mod tests {
             Device::new("LON1".into(), 1, "Operator1".into()),
             Device::new("PAR1".into(), 1, "Operator2".into()),
         ];
-        let demands = vec![Demand::new("NYC".into(), "PAR".into(), 1, 50.0, 1.0, 1, false)];
+        let demands = vec![Demand::new(
+            "NYC".into(),
+            "PAR".into(),
+            1,
+            50.0,
+            1.0,
+            1,
+            false,
+        )];
         let public_links = vec![PublicLink::new("NYC".into(), "PAR".into(), 100.0)];
 
         let input = ShapleyInput {
@@ -822,7 +1297,71 @@ mod tests {
             assert!(
                 err < 0.05,
                 "{op}: exact={:.4} sampled={:.4} err={:.4}",
-                ev.proportion, sv.proportion, err
+                ev.proportion,
+                sv.proportion,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_sampled_matches_exact_with_uptime() {
+        // Regression for the bug where compute_sampled ignored operator_uptime
+        // and therefore computed a different quantity than exact compute() for
+        // the production default uptime < 1.0. With the Bernoulli active-set
+        // estimator the sampled proportions must converge to exact.
+        let private_links = vec![
+            PrivateLink::new("NYC1".into(), "LON1".into(), 10.0, 100.0, 1.0, Some(1)),
+            PrivateLink::new("LON1".into(), "PAR1".into(), 10.0, 100.0, 1.0, Some(2)),
+        ];
+        let devices = vec![
+            Device::new("NYC1".into(), 1, "Operator1".into()),
+            Device::new("LON1".into(), 1, "Operator1".into()),
+            Device::new("PAR1".into(), 1, "Operator2".into()),
+        ];
+        let demands = vec![Demand::new(
+            "NYC".into(),
+            "PAR".into(),
+            1,
+            50.0,
+            1.0,
+            1,
+            false,
+        )];
+        let public_links = vec![PublicLink::new("NYC".into(), "PAR".into(), 100.0)];
+
+        let input = ShapleyInput {
+            private_links,
+            devices,
+            demands,
+            public_links,
+            operator_uptime: 0.9, // < 1.0 — exercises the uptime expectation
+            contiguity_bonus: 5.0,
+            demand_multiplier: 1.0,
+        };
+
+        let exact = input.compute().expect("exact compute should succeed");
+        let sampled = input
+            .compute_sampled(SamplingConfig {
+                min_samples: 4000,
+                max_samples: 4000,
+                target_se: 0.0001,
+                batch_size: 4000,
+            })
+            .expect("sampled compute should succeed");
+
+        for (op, ev) in &exact {
+            let sv = sampled
+                .values
+                .get(op)
+                .unwrap_or_else(|| panic!("operator {op} missing from sampled output"));
+            let err = (ev.proportion - sv.proportion).abs();
+            assert!(
+                err < 0.06,
+                "{op}: exact={:.4} sampled={:.4} err={:.4} (uptime path must match exact)",
+                ev.proportion,
+                sv.proportion,
+                err
             );
         }
     }
@@ -838,7 +1377,15 @@ mod tests {
             Device::new("LON1".into(), 1, "Operator1".into()),
             Device::new("PAR1".into(), 1, "Operator2".into()),
         ];
-        let demands = vec![Demand::new("NYC".into(), "PAR".into(), 1, 50.0, 1.0, 1, false)];
+        let demands = vec![Demand::new(
+            "NYC".into(),
+            "PAR".into(),
+            1,
+            50.0,
+            1.0,
+            1,
+            false,
+        )];
         let public_links = vec![PublicLink::new("NYC".into(), "PAR".into(), 100.0)];
 
         let input = ShapleyInput {
@@ -855,26 +1402,22 @@ mod tests {
             .compute_sampled(SamplingConfig::default())
             .expect("sampled compute should succeed");
 
-        assert!(result.converged, "should converge for simple 2-operator case");
+        assert!(
+            result.converged,
+            "should converge for simple 2-operator case"
+        );
         assert!(
             result.samples_used >= 100,
             "should use at least min_samples"
         );
-        assert!(
-            result.samples_used <= 500,
-            "should not exceed max_samples"
-        );
+        assert!(result.samples_used <= 500, "should not exceed max_samples");
         assert_eq!(result.values.len(), 2, "should have 2 operators");
     }
 
     #[test]
     fn test_welford_statistics() {
         // Known values: 3 samples of 2 operators
-        let marginals = vec![
-            vec![10.0, 20.0],
-            vec![12.0, 18.0],
-            vec![11.0, 22.0],
-        ];
+        let marginals = vec![vec![10.0, 20.0], vec![12.0, 18.0], vec![11.0, 22.0]];
         let (means, ses) = welford_statistics(&marginals, 2);
 
         assert!((means[0] - 11.0).abs() < 1e-10, "mean[0] should be 11.0");
@@ -883,7 +1426,11 @@ mod tests {
         // SE = sqrt(variance / n) where variance = Σ(x-μ)²/(n-1)
         // For op0: var = ((10-11)² + (12-11)² + (11-11)²) / 2 = 1.0
         // SE = sqrt(1.0 / 3) ≈ 0.5774
-        assert!((ses[0] - (1.0f64 / 3.0).sqrt()).abs() < 1e-10, "SE[0] mismatch: {}", ses[0]);
+        assert!(
+            (ses[0] - (1.0f64 / 3.0).sqrt()).abs() < 1e-10,
+            "SE[0] mismatch: {}",
+            ses[0]
+        );
     }
 
     #[test]

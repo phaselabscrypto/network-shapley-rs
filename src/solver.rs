@@ -1,8 +1,3 @@
-use microlp::{ComparisonOp, StopReason, VarDomain};
-#[cfg(test)]
-use microlp::{OptimizationDirection, Variable};
-use sprs::TriMatI;
-
 use crate::{
     error::{Result, ShapleyError},
     lp_builder::LpPrimitives,
@@ -33,11 +28,6 @@ pub(crate) struct CoalitionBuffers {
     pub col_remap: Vec<usize>,
     pub cost: Vec<f64>,
     pub keep_rows: Vec<usize>,
-    pub var_mins: Vec<f64>,
-    pub var_maxs: Vec<f64>,
-    pub var_domains: Vec<VarDomain>,
-    pub ops: Vec<ComparisonOp>,
-    pub rhs: Vec<f64>,
 }
 
 impl CoalitionBuffers {
@@ -46,11 +36,6 @@ impl CoalitionBuffers {
             col_remap: vec![usize::MAX; n_cols],
             cost: Vec::with_capacity(n_cols),
             keep_rows: Vec::with_capacity(256),
-            var_mins: Vec::with_capacity(n_cols),
-            var_maxs: Vec::with_capacity(n_cols),
-            var_domains: Vec::with_capacity(n_cols),
-            ops: Vec::with_capacity(1024),
-            rhs: Vec::with_capacity(1024),
         }
     }
 
@@ -58,11 +43,6 @@ impl CoalitionBuffers {
         self.col_remap.fill(usize::MAX);
         self.cost.clear();
         self.keep_rows.clear();
-        self.var_mins.clear();
-        self.var_maxs.clear();
-        self.var_domains.clear();
-        self.ops.clear();
-        self.rhs.clear();
     }
 }
 
@@ -73,10 +53,10 @@ pub(crate) enum SolveStatus {
     Infeasible,
 }
 
-/// LP solver wrapper for microlp (used in tests)
+/// LP solver wrapper for HiGHS (used in tests)
 #[cfg(test)]
 pub(crate) struct LpSolver {
-    problem: microlp::Problem,
+    pb: highs::RowProblem,
 }
 
 /// Result of solving an LP (used in tests)
@@ -113,45 +93,46 @@ impl LpSolver {
         a_ub: &CscMatrix<f64>,
         b_ub: &[f64],
     ) -> Result<Self> {
-        let mut problem = microlp::Problem::new(OptimizationDirection::Minimize);
+        let mut pb = highs::RowProblem::default();
 
         // Add variables with cost coefficients and non-negativity bounds
-        let vars: Vec<Variable> = cost
-            .iter()
-            .map(|&c| problem.add_var(c, (0.0, f64::INFINITY)))
-            .collect();
+        let vars: Vec<highs::Col> = cost.iter().map(|&c| pb.add_column(c, 0.0..)).collect();
 
         // Add equality constraints (A_eq * x = b_eq)
         let eq_rows = rows_from_csc(a_eq);
         for (row_idx, entries) in eq_rows.iter().enumerate() {
-            let terms: Vec<(Variable, f64)> =
+            let terms: Vec<(highs::Col, f64)> =
                 entries.iter().map(|&(col, val)| (vars[col], val)).collect();
-            problem.add_constraint(&terms, ComparisonOp::Eq, b_eq[row_idx]);
+            pb.add_row(b_eq[row_idx]..=b_eq[row_idx], &terms);
         }
 
         // Add inequality constraints (A_ub * x <= b_ub)
         let ub_rows = rows_from_csc(a_ub);
         for (row_idx, entries) in ub_rows.iter().enumerate() {
-            let terms: Vec<(Variable, f64)> =
+            let terms: Vec<(highs::Col, f64)> =
                 entries.iter().map(|&(col, val)| (vars[col], val)).collect();
-            problem.add_constraint(&terms, ComparisonOp::Le, b_ub[row_idx]);
+            pb.add_row(..=b_ub[row_idx], &terms);
         }
 
-        Ok(Self { problem })
+        Ok(Self { pb })
     }
 
     /// Solve the LP problem
     pub(crate) fn solve(self) -> Result<LpSolution> {
-        match self.problem.solve() {
-            Ok(solution) => Ok(LpSolution {
+        let solved = self.pb.optimise(highs::Sense::Minimise).solve();
+        match solved.status() {
+            highs::HighsModelStatus::Optimal => Ok(LpSolution {
                 status: SolveStatus::Solved,
-                objective_value: solution.objective(),
+                objective_value: solved.objective_value(),
             }),
-            Err(microlp::Error::Infeasible) => Ok(LpSolution {
+            highs::HighsModelStatus::Infeasible => Ok(LpSolution {
                 status: SolveStatus::Infeasible,
                 objective_value: 0.0,
             }),
-            Err(e) => Err(ShapleyError::LpSolver(format!("LP solver error: {e}"))),
+            other => Err(ShapleyError::LpSolver(format!(
+                "HiGHS solver failed: {:?}",
+                other
+            ))),
         }
     }
 }
@@ -167,6 +148,18 @@ pub(crate) struct CoalitionResult {
 ///
 /// `coalition_mask` has bit i set for each operator i in the coalition,
 /// plus `ALWAYS_BIT` so that Public/Private/empty operators always match.
+///
+/// B2 (HiGHS warm-start) — investigated and intentionally NOT done. Each call
+/// builds a FRESH `RowProblem` whose column set+count (subset/remapped via
+/// `col_remap`) and ub-row set (`keep_rows`) are coalition-specific, so a HiGHS
+/// basis/dual warm-start — valid only when variable + constraint structure match
+/// the prior solve — never applies. The sampler also solves a dedup'd mask set in
+/// arbitrary `par_iter` order, so adjacent solves on a worker are unrelated
+/// coalitions with no basis locality. The thread-local `CoalitionBuffers` already
+/// amortize the reusable allocations, and `presolve=on` (where the time goes) is
+/// re-run per call. A real warm-start would need a fixed full-size model with
+/// per-coalition bound toggling — a large rewrite risking changed objectives —
+/// for no expected gain. Fewer LPs (B3 selective reuse) is the better lever.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_coalition(
     primitives: &LpPrimitives,
@@ -211,85 +204,76 @@ pub(crate) fn solve_coalition(
         }
     }
 
-    let n_kept = new_col;
+    // ── Build the HiGHS model directly from the precomputed rows ─────────
+    // No intermediate TriMatI/CSR: feed `add_row` straight from
+    // precomputed.eq_rows + the kept ub_rows, remapping each original column
+    // to the coalition's kept column. Output-identical to the old CSR path
+    // (column subsetting and an empty "0 (cmp) rhs" row are LP-equivalent),
+    // but skips a full triplet build + sort + read-back on every solve.
+    let mut pb = highs::RowProblem::default();
 
-    // Step 3: Build a single CSR constraint matrix via triplets, avoiding
-    // per-row CsVec allocations.
+    // Variables: cost coefficients, non-negative bounds [0, ∞).
+    let vars: Vec<highs::Col> = buffers
+        .cost
+        .iter()
+        .map(|&c| pb.add_column(c, 0.0..))
+        .collect();
 
-    let n_eq_rows = precomputed.eq_rows.len();
-    let n_ub_rows = buffers.keep_rows.len();
-    let n_total_rows = n_eq_rows + n_ub_rows;
+    // Per-row scratch, reused across rows to avoid a per-row allocation.
+    let mut entries: Vec<(highs::Col, f64)> = Vec::with_capacity(64);
 
-    let mut triplets = TriMatI::<f64, usize>::new((n_total_rows, n_kept));
-    let mut row = 0;
-
-    // Equality constraints — all rows, remap columns
-    for (row_idx, entries) in precomputed.eq_rows.iter().enumerate() {
-        for &(old_col, val) in entries {
+    // Equality constraints — all rows, remapped (rhs ..= rhs).
+    for (row_idx, row_entries) in precomputed.eq_rows.iter().enumerate() {
+        entries.clear();
+        for &(old_col, val) in row_entries {
             let nc = buffers.col_remap[old_col];
             if nc != usize::MAX {
-                triplets.add_triplet(row, nc, val);
+                entries.push((vars[nc], val));
             }
         }
-        buffers.ops.push(ComparisonOp::Eq);
-        buffers.rhs.push(primitives.b_eq[row_idx]);
-        row += 1;
+        let b = primitives.b_eq[row_idx];
+        pb.add_row(b..=b, &entries);
     }
 
-    // Inequality constraints — only kept rows, remap columns
-    for keep_idx in 0..n_ub_rows {
-        let row_idx = buffers.keep_rows[keep_idx];
+    // Inequality constraints — only kept rows, remapped (..= rhs).
+    for &row_idx in &buffers.keep_rows {
+        entries.clear();
         for &(old_col, val) in &precomputed.ub_rows[row_idx] {
             let nc = buffers.col_remap[old_col];
             if nc != usize::MAX {
-                triplets.add_triplet(row, nc, val);
+                entries.push((vars[nc], val));
             }
         }
-        buffers.ops.push(ComparisonOp::Le);
-        buffers.rhs.push(primitives.b_ub[row_idx]);
-        row += 1;
+        pb.add_row(..=primitives.b_ub[row_idx], &entries);
     }
 
-    let constraint_matrix = triplets.to_csr();
+    // Solve — tune HiGHS for repeated medium LPs in a rayon pool:
+    //  - threads=1: avoid contention with rayon (1 LP per rayon thread)
+    //  - simplex_strategy=1: dual serial simplex (fastest for sparse medium LPs)
+    //  - presolve=on: reduces ~1148-row constraint matrices significantly
+    let mut model = pb
+        .try_optimise(highs::Sense::Minimise)
+        .map_err(|_| ShapleyError::LpSolver("HiGHS model construction failed".to_string()))?;
+    model.set_option("threads", 1_i32);
+    model.set_option("simplex_strategy", 1_i32);
+    model.set_option("presolve", "on");
+    let solved = model.solve();
 
-    // Build variable bounds and domains
-    buffers.var_mins.resize(n_kept, 0.0);
-    buffers.var_maxs.resize(n_kept, f64::INFINITY);
-    buffers.var_domains.resize(n_kept, VarDomain::Real);
-
-    // Solve using the vendored solver directly with pre-built CSR matrix
-    let solver_result = crate::simplex::solver::Solver::try_new_from_matrix(
-        &buffers.cost,
-        &buffers.var_mins,
-        &buffers.var_maxs,
-        constraint_matrix,
-        &buffers.ops,
-        &buffers.rhs,
-        &buffers.var_domains,
-        None,
-    );
-
-    match solver_result {
-        Ok(mut solver) => match solver.initial_solve() {
-            Ok(StopReason::Finished) => Ok(CoalitionResult {
-                status: SolveStatus::Solved,
-                objective_value: solver.cur_obj_val,
-            }),
-            Ok(StopReason::Limit) => Ok(CoalitionResult {
-                status: SolveStatus::Solved,
-                objective_value: solver.cur_obj_val,
-            }),
-            Err(microlp::Error::Infeasible) => Ok(CoalitionResult {
+    match solved.status() {
+        highs::HighsModelStatus::Optimal => Ok(CoalitionResult {
+            status: SolveStatus::Solved,
+            objective_value: solved.objective_value(),
+        }),
+        highs::HighsModelStatus::Infeasible | highs::HighsModelStatus::UnboundedOrInfeasible => {
+            Ok(CoalitionResult {
                 status: SolveStatus::Infeasible,
                 objective_value: 0.0,
-            }),
-            Err(e) => Err(ShapleyError::LpSolver(format!("LP solver error: {e}"))),
-        },
-        Err(microlp::Error::Infeasible) => Ok(CoalitionResult {
-            status: SolveStatus::Infeasible,
-            objective_value: 0.0,
-        }),
-        Err(e) => Err(ShapleyError::LpSolver(format!("LP solver error: {e}"))),
+            })
+        }
+        other => Err(ShapleyError::LpSolver(format!(
+            "HiGHS solver failed: {:?}",
+            other
+        ))),
     }
 }
 
@@ -396,16 +380,12 @@ mod tests {
         buf.cost.push(1.0);
         buf.cost.push(2.0);
         buf.keep_rows.push(0);
-        buf.ops.push(ComparisonOp::Eq);
-        buf.rhs.push(5.0);
 
         // Reset should clear everything
         buf.reset();
         assert!(buf.col_remap.iter().all(|&v| v == usize::MAX));
         assert!(buf.cost.is_empty());
         assert!(buf.keep_rows.is_empty());
-        assert!(buf.ops.is_empty());
-        assert!(buf.rhs.is_empty());
 
         // Capacity should be preserved (no reallocation)
         assert!(buf.cost.capacity() >= 10);
