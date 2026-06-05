@@ -228,7 +228,63 @@ impl ShapleyInput {
             self.contiguity_bonus,
             self.demand_multiplier,
         );
-        shapley.compute_inner(seed_cache, &changed_operators)
+        shapley.compute_inner(seed_cache, &changed_operators, None)
+    }
+
+    /// Like [`Self::compute`] but cooperatively cancellable, and reports live
+    /// per-coalition progress via `control` (set `control.cancel` from another
+    /// thread to stop early — returns [`ShapleyError::Cancelled`]). The exact-path
+    /// counterpart of [`Self::compute_sampled_cancellable`]; output is identical to
+    /// [`Self::compute`]. The shared atomic counters in `control.progress` let a
+    /// caller running many of these in parallel (e.g. one per source city)
+    /// aggregate a single smooth progress bar.
+    pub fn compute_cancellable(&self, control: &ComputeControl) -> Result<ShapleyOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_inner(HashMap::new(), &[], Some(control))
+    }
+
+    /// Like [`Self::compute_with_reuse`] but cooperatively cancellable with live
+    /// per-coalition progress via `control`. Output is identical to
+    /// [`Self::compute_with_reuse`].
+    pub fn compute_with_reuse_cancellable(
+        &self,
+        seed_cache: HashMap<u32, Option<f64>>,
+        changed_operators: Vec<String>,
+        control: &ComputeControl,
+    ) -> Result<ShapleyOutput> {
+        let shapley = Shapley::new(
+            self.private_links.clone(),
+            self.devices.clone(),
+            self.demands.clone(),
+            self.public_links.clone(),
+            self.operator_uptime,
+            self.contiguity_bonus,
+            self.demand_multiplier,
+        );
+        shapley.compute_inner(seed_cache, &changed_operators, Some(control))
+    }
+
+    /// Number of coalition-LPs an exact [`Self::compute`] / [`Self::compute_cancellable`]
+    /// enumerates for this input: `2^operators` (operators deduped, excluding the
+    /// "Private"/"Public" sentinels — the same set [`Self::compute`] enumerates). Lets a
+    /// caller size a progress denominator without re-deriving the operator set.
+    pub fn coalition_count(&self) -> usize {
+        let n_operators = self
+            .devices
+            .iter()
+            .map(|d| d.operator.as_str())
+            .filter(|op| *op != "Private" && *op != "Public")
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        1usize << n_operators
     }
 }
 
@@ -409,7 +465,7 @@ impl Shapley {
     }
 
     fn compute(&self) -> Result<ShapleyOutput> {
-        self.compute_inner(HashMap::new(), &[])
+        self.compute_inner(HashMap::new(), &[], None)
     }
 
     /// Exact compute with optional SOUND coalition reuse (B3). `seed_cache`
@@ -421,6 +477,7 @@ impl Shapley {
         &self,
         seed_cache: HashMap<u32, Option<f64>>,
         changed_operators: &[String],
+        control: Option<&ComputeControl>,
     ) -> Result<ShapleyOutput> {
         // Validate inputs
         check_inputs(
@@ -533,10 +590,19 @@ impl Shapley {
             static BUFFERS: RefCell<Option<CoalitionBuffers>> = const { RefCell::new(None) };
         }
 
-        // Solve LP for each coalition
+        // Solve LP for each coalition. When `control` is set, report per-coalition
+        // progress and honour cancellation exactly as the sampled path does (see
+        // `run_sampling`): the shared atomic counters let a caller running many of
+        // these in parallel (e.g. one exact solve per source city) aggregate a
+        // single smooth progress bar. With `control == None` this is a no-op, so
+        // `compute()` is byte-identical to before.
         let coalition_values: Vec<Option<f64>> = (0..n_coalitions)
             .into_par_iter()
             .map(|coalition_idx| {
+                if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
+                    return None;
+                }
+
                 let coalition_mask = (coalition_idx as u32) | ALWAYS_BIT;
 
                 // B3 reuse: a coalition excluding every changed operator has an
@@ -544,10 +610,14 @@ impl Shapley {
                 if (coalition_idx as u32) & reuse_gate == 0
                     && let Some(&seeded) = seed_cache.get(&coalition_mask)
                 {
+                    if let Some(c) = control {
+                        c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
+                        c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
+                    }
                     return seeded;
                 }
 
-                BUFFERS.with(|cell| {
+                let value = BUFFERS.with(|cell| {
                     let mut borrow = cell.borrow_mut();
                     let buf = borrow.get_or_insert_with(|| CoalitionBuffers::new(n_cols));
 
@@ -570,9 +640,21 @@ impl Shapley {
                         }
                         Err(_) => None,
                     }
-                })
+                });
+
+                if let Some(c) = control {
+                    c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
+                    c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
+                }
+                value
             })
             .collect();
+
+        // Cooperative cancellation: if requested mid-solve, stop before the
+        // (cheap) Shapley aggregation rather than return a partial result.
+        if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
+            return Err(ShapleyError::Cancelled);
+        }
 
         // Compute expected values with operator uptime
         let expected_values = if self.operator_uptime < 1.0 {
