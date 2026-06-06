@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Display, Formatter},
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 use rand::Rng;
@@ -19,7 +19,10 @@ use crate::{
     consolidation::{consolidate_demand, consolidate_links},
     error::{Result, ShapleyError},
     lp_builder::LpBuilderInput,
-    solver::{CoalitionBuffers, PrecomputedRows, SolveStatus, solve_coalition},
+    solver::{
+        CoalitionBuffers, LpTemplate, PrecomputedRows, SolveStatus, WarmCoalitionSolver,
+        solve_coalition,
+    },
     types::{Demands, Devices, PrivateLinks, PublicLinks},
     utils::factorial,
     validation::check_inputs,
@@ -29,6 +32,34 @@ use crate::{
 /// (Public, Private, empty). Set in bit 31 so it never collides with
 /// operator index bits 0..19.
 const ALWAYS_BIT: u32 = 1 << 31;
+
+/// Monotonic id stamped on each exact `compute_inner` run. A thread-local
+/// [`WarmCoalitionSolver`] carries the epoch it was built for; when a rayon worker
+/// is reused across `compute()` calls, a stale solver (different problem) is
+/// rebuilt rather than incorrectly reused.
+///
+/// CALLER CONTRACT — concurrency: warm-start state is a per-rayon-worker
+/// thread-local keyed by this global epoch. It assumes ONE exact `compute()`'s
+/// coalition loop owns the rayon pool at a time. If a caller runs multiple
+/// `compute()` calls concurrently on the SAME rayon pool (e.g. a per-city reward
+/// path written as `cities.par_iter().map(|c| c.compute())`), work-stealing
+/// interleaves their coalitions on a worker, each access sees a different epoch and
+/// rebuilds the HiGHS model — correct, but it thrashes back to fresh-build cost.
+/// Run such batches SEQUENTIALLY (each `compute()`'s own coalition loop already
+/// uses the whole pool); the parallelism is within a `compute()`, not across them.
+///
+/// CALLER CONTRACT — determinism: warm-starting seeds each coalition solve from
+/// the basis left by the previous coalition that worker happened to solve, and
+/// rayon's order is nondeterministic. The optimum is unique, so coalition values
+/// are stable to floating-point rounding (≪ the DZ 4-dp parity bar) but are NOT
+/// guaranteed bit-identical run-to-run the way the fresh path was. A caller that
+/// quantises raw values into integer reward leaves should gate on an exact-leaf
+/// golden test at THAT boundary (which lives in the service, not this crate).
+static PROBLEM_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_problem_epoch() -> u64 {
+    PROBLEM_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 // For clarity
 pub type Operator = String;
@@ -526,8 +557,12 @@ impl Shapley {
         // Build LP primitives
         let primitives = LpBuilderInput::new(&full_map, &full_demand).build()?;
 
-        // Pre-compute row-oriented constraint data (once, before the coalition loop)
-        let precomputed = PrecomputedRows::new(&primitives);
+        // Build the full-size LP template once and share it across rayon workers.
+        // Each worker turns it into its own persistent HiGHS model and re-solves
+        // every coalition by toggling column bounds (warm-start), rather than
+        // rebuilding the model and re-running presolve per coalition.
+        let template = Arc::new(LpTemplate::from_primitives(&primitives));
+        let problem_epoch = next_problem_epoch();
 
         // Pre-compute operator bitmasks (once, before the parallel loop)
         let op_index: HashMap<&str, u8> = operators
@@ -564,16 +599,10 @@ impl Shapley {
             .iter()
             .map(|s| operator_mask(s))
             .collect();
-        let row_op1_mask: Vec<u32> = primitives
-            .row_op1
-            .iter()
-            .map(|s| operator_mask(s))
-            .collect();
-        let row_op2_mask: Vec<u32> = primitives
-            .row_op2
-            .iter()
-            .map(|s| operator_mask(s))
-            .collect();
+        // Row (bandwidth) gating is unnecessary for the warm path: excluded columns
+        // are pinned to zero, so any row referencing only excluded columns collapses
+        // to `0 <= rhs`. (The fresh-build `solve_coalition` still gates rows; that
+        // path lives in `run_sampling`.)
 
         let n_coalitions = 1 << n_operators;
         let n_cols = col_op1_mask.len();
@@ -586,8 +615,13 @@ impl Shapley {
             n_coalitions,
         );
 
+        // Persists across calls: each rayon worker keeps its last-built HiGHS model
+        // until a new epoch replaces it (or the thread dies). That is `num_threads`
+        // resident models between computes — bounded, but heavier than the old
+        // `CoalitionBuffers`; the epoch check (re)builds lazily on next use.
         thread_local! {
-            static BUFFERS: RefCell<Option<CoalitionBuffers>> = const { RefCell::new(None) };
+            static WARM_SOLVER: RefCell<Option<WarmCoalitionSolver>> =
+                const { RefCell::new(None) };
         }
 
         // Solve LP for each coalition. When `control` is set, report per-coalition
@@ -617,20 +651,28 @@ impl Shapley {
                     return seeded;
                 }
 
-                let value = BUFFERS.with(|cell| {
-                    let mut borrow = cell.borrow_mut();
-                    let buf = borrow.get_or_insert_with(|| CoalitionBuffers::new(n_cols));
+                let value = WARM_SOLVER.with(|cell| {
+                    let mut slot = cell.borrow_mut();
 
-                    match solve_coalition(
-                        &primitives,
-                        &precomputed,
-                        buf,
-                        coalition_mask,
-                        &col_op1_mask,
-                        &col_op2_mask,
-                        &row_op1_mask,
-                        &row_op2_mask,
-                    ) {
+                    // Rebuild the thread-local solver if it is missing or was built
+                    // for a different problem (rayon workers persist across calls).
+                    let stale = slot.as_ref().is_none_or(|w| w.epoch() != problem_epoch);
+                    if stale {
+                        match WarmCoalitionSolver::from_template(problem_epoch, template.clone()) {
+                            Ok(w) => *slot = Some(w),
+                            Err(e) => {
+                                // A systemic build failure (not a normal infeasible
+                                // coalition) — surface it instead of silently
+                                // turning every coalition into `None`.
+                                eprintln!("[shapley] warm solver build failed: {e}");
+                                *slot = None;
+                                return None;
+                            }
+                        }
+                    }
+
+                    let solver = slot.as_mut().expect("warm solver present");
+                    match solver.solve(coalition_mask, &col_op1_mask, &col_op2_mask) {
                         Ok(result) => {
                             if matches!(result.status, SolveStatus::Solved) {
                                 Some(-result.objective_value) // Negative because we minimize
@@ -638,7 +680,15 @@ impl Shapley {
                                 None // Infeasible coalition
                             }
                         }
-                        Err(_) => None,
+                        // Distinguish a hard solver error from a legitimately
+                        // infeasible coalition: both map to `None` (matching the
+                        // fresh path), but a real error must not pass silently.
+                        Err(e) => {
+                            eprintln!(
+                                "[shapley] coalition warm solve error (treated as infeasible): {e}"
+                            );
+                            None
+                        }
                     }
                 });
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     error::{Result, ShapleyError},
     lp_builder::LpPrimitives,
@@ -149,17 +151,22 @@ pub(crate) struct CoalitionResult {
 /// `coalition_mask` has bit i set for each operator i in the coalition,
 /// plus `ALWAYS_BIT` so that Public/Private/empty operators always match.
 ///
-/// B2 (HiGHS warm-start) — investigated and intentionally NOT done. Each call
-/// builds a FRESH `RowProblem` whose column set+count (subset/remapped via
-/// `col_remap`) and ub-row set (`keep_rows`) are coalition-specific, so a HiGHS
-/// basis/dual warm-start — valid only when variable + constraint structure match
-/// the prior solve — never applies. The sampler also solves a dedup'd mask set in
-/// arbitrary `par_iter` order, so adjacent solves on a worker are unrelated
-/// coalitions with no basis locality. The thread-local `CoalitionBuffers` already
-/// amortize the reusable allocations, and `presolve=on` (where the time goes) is
-/// re-run per call. A real warm-start would need a fixed full-size model with
-/// per-coalition bound toggling — a large rewrite risking changed objectives —
-/// for no expected gain. Fewer LPs (B3 selective reuse) is the better lever.
+/// This is the *fresh-build* coalition solve: it constructs a new `RowProblem`
+/// holding only the coalition's active columns (subset/remapped via `col_remap`)
+/// and kept ub-rows (`keep_rows`), then re-runs presolve. It backs the sampling
+/// path — which solves a dedup'd mask set in arbitrary `par_iter` order, so there
+/// is no basis locality to exploit — and serves as the parity oracle for the
+/// warm-start path.
+///
+/// The exact path ([`crate::shapley::Shapley::compute`]) instead uses
+/// [`WarmCoalitionSolver`]. Earlier this warm-start was thought infeasible because
+/// each coalition's column/row *set* differs. But gating is purely operator-based,
+/// so a coalition is just the SAME full-size model with the excluded operators'
+/// columns pinned to `[0, 0]` — identical variable/constraint structure across
+/// coalitions. HiGHS dual simplex then warm-starts from the retained basis
+/// (presolve off) instead of paying a cold presolve per solve. Equivalence with
+/// this fresh-build objective is asserted per-coalition by the `warm_matches_fresh`
+/// test, so the speedup never costs accuracy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_coalition(
     primitives: &LpPrimitives,
@@ -277,13 +284,422 @@ pub(crate) fn solve_coalition(
     }
 }
 
+/// Full-size, coalition-independent description of the LP, built once per
+/// `compute()` and shared (via `Arc`) across rayon workers. Each worker turns it
+/// into its own persistent [`highs::Model`] for warm-started re-solving.
+///
+/// Unlike the fresh-build path, columns are NOT subset per coalition: the model
+/// always contains every column and every row (eq + ub) at their original
+/// indices. A coalition is expressed purely by pinning excluded columns to
+/// `[0, 0]` (see [`WarmCoalitionSolver::solve`]).
+pub(crate) struct LpTemplate {
+    cost: Vec<f64>,
+    eq_rows: Vec<Vec<(usize, f64)>>,
+    ub_rows: Vec<Vec<(usize, f64)>>,
+    b_eq: Vec<f64>,
+    b_ub: Vec<f64>,
+}
+
+impl LpTemplate {
+    /// Build the template from the full (unfiltered) LP primitives.
+    pub(crate) fn from_primitives(primitives: &LpPrimitives) -> Self {
+        Self {
+            cost: primitives.cost.clone(),
+            eq_rows: rows_from_csc(&primitives.a_eq),
+            ub_rows: rows_from_csc(&primitives.a_ub),
+            b_eq: primitives.b_eq.clone(),
+            b_ub: primitives.b_ub.clone(),
+        }
+    }
+
+    /// Construct a fresh HiGHS model holding every column (bounds `[0, ∞)`) and
+    /// every constraint, tuned for warm-started re-solving. Returns the model and
+    /// the column handles (indexed identically to `cost` / the mask vectors).
+    fn build_model(&self) -> Result<(highs::Model, Vec<highs::Col>)> {
+        let mut pb = highs::RowProblem::default();
+
+        let vars: Vec<highs::Col> = self.cost.iter().map(|&c| pb.add_column(c, 0.0..)).collect();
+
+        let mut entries: Vec<(highs::Col, f64)> = Vec::with_capacity(64);
+
+        // Equality (flow-conservation) rows — all kept, full column set.
+        for (row_idx, row) in self.eq_rows.iter().enumerate() {
+            entries.clear();
+            for &(col, val) in row {
+                entries.push((vars[col], val));
+            }
+            let b = self.b_eq[row_idx];
+            pb.add_row(b..=b, &entries);
+        }
+
+        // Inequality (bandwidth) rows — all kept, full column set. Rows touching
+        // only excluded (pinned-to-zero) columns collapse to `0 <= rhs`, so they
+        // never need per-coalition mutation.
+        for (row_idx, row) in self.ub_rows.iter().enumerate() {
+            entries.clear();
+            for &(col, val) in row {
+                entries.push((vars[col], val));
+            }
+            pb.add_row(..=self.b_ub[row_idx], &entries);
+        }
+
+        let mut model = pb.try_optimise(highs::Sense::Minimise).map_err(|_| {
+            ShapleyError::LpSolver("HiGHS warm model construction failed".to_string())
+        })?;
+        // Warm-start tuning:
+        //  - solver=simplex + simplex_strategy=1 (dual): dual simplex restores
+        //    optimality fastest after a variable-bound change.
+        //  - presolve=off: presolve would discard the basis between runs, which is
+        //    exactly what we want to retain.
+        //  - threads=1: one LP per rayon worker, no nested parallelism.
+        model.set_option("threads", 1_i32);
+        model.set_option("solver", "simplex");
+        model.set_option("simplex_strategy", 1_i32);
+        model.set_option("presolve", "off");
+        model.make_quiet();
+        Ok((model, vars))
+    }
+}
+
+/// A persistent, per-thread HiGHS model that solves successive coalitions by
+/// toggling column bounds and re-solving from the retained simplex basis, instead
+/// of rebuilding the model and re-running presolve per coalition.
+///
+/// `epoch` identifies the `compute()` call this model was built for: a thread-local
+/// solver from a previous (different) problem must be rebuilt rather than reused.
+pub(crate) struct WarmCoalitionSolver {
+    epoch: u64,
+    template: Arc<LpTemplate>,
+    /// `Some` between solves; momentarily `None` while a solve is in flight (the
+    /// HiGHS `Model` is consumed by `try_solve` and handed back afterwards). Left
+    /// `None` after a hard solver error so the next call rebuilds from `template`.
+    model: Option<highs::Model>,
+    vars: Vec<highs::Col>,
+    /// Current active/excluded state of each column, so we only issue
+    /// `change_column_bounds` for columns that actually flip.
+    col_active: Vec<bool>,
+}
+
+impl WarmCoalitionSolver {
+    /// Build a solver for the given problem `epoch` from a shared template.
+    pub(crate) fn from_template(epoch: u64, template: Arc<LpTemplate>) -> Result<Self> {
+        let (model, vars) = template.build_model()?;
+        let col_active = vec![true; vars.len()];
+        Ok(Self {
+            epoch,
+            template,
+            model: Some(model),
+            vars,
+            col_active,
+        })
+    }
+
+    /// The `compute()` epoch this solver was built for.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Solve one coalition. A column is active iff BOTH its endpoint operators are
+    /// in `coalition_mask` (identical gate to [`solve_coalition`]); excluded
+    /// columns are pinned to `[0, 0]`. Rows are never mutated — see [`LpTemplate`].
+    pub(crate) fn solve(
+        &mut self,
+        coalition_mask: u32,
+        col_op1_mask: &[u32],
+        col_op2_mask: &[u32],
+    ) -> Result<CoalitionResult> {
+        // Recover from a prior hard solver error by rebuilding the model.
+        if self.model.is_none() {
+            let (model, vars) = self.template.build_model()?;
+            self.vars = vars;
+            self.col_active = vec![true; self.vars.len()];
+            self.model = Some(model);
+        }
+
+        let model = self.model.as_mut().expect("warm model present");
+
+        let n = self.vars.len();
+        let mut active_count = 0usize;
+        for i in 0..n {
+            let active =
+                (col_op1_mask[i] & coalition_mask) != 0 && (col_op2_mask[i] & coalition_mask) != 0;
+            if active {
+                active_count += 1;
+            }
+            if active != self.col_active[i] {
+                if active {
+                    model.change_column_bounds(self.vars[i], 0.0..);
+                } else {
+                    model.change_column_bounds(self.vars[i], 0.0..=0.0);
+                }
+                self.col_active[i] = active;
+            }
+        }
+
+        // No active columns ⇒ empty sub-LP, matching `solve_coalition`'s
+        // "No columns selected" early return (mapped to `None` by the caller).
+        if active_count == 0 {
+            return Ok(CoalitionResult {
+                status: SolveStatus::Infeasible,
+                objective_value: 0.0,
+            });
+        }
+
+        // Warm re-solve on the same HiGHS object: dual simplex restarts from the
+        // retained basis (presolve is off). `try_solve` consumes the model; on
+        // success we take it back via `From<SolvedModel>` for the next coalition.
+        let model = self.model.take().expect("warm model present");
+        match model.try_solve() {
+            Ok(solved) => {
+                let status = solved.status();
+                let objective_value = solved.objective_value();
+                self.model = Some(highs::Model::from(solved));
+                match status {
+                    highs::HighsModelStatus::Optimal => Ok(CoalitionResult {
+                        status: SolveStatus::Solved,
+                        objective_value,
+                    }),
+                    highs::HighsModelStatus::Infeasible
+                    | highs::HighsModelStatus::UnboundedOrInfeasible => Ok(CoalitionResult {
+                        status: SolveStatus::Infeasible,
+                        objective_value: 0.0,
+                    }),
+                    other => Err(ShapleyError::LpSolver(format!(
+                        "HiGHS solver failed: {:?}",
+                        other
+                    ))),
+                }
+            }
+            // `try_solve` only errors on a structurally invalid model, which should
+            // never happen here. Leave `model` None so the next call rebuilds.
+            Err(_) => Err(ShapleyError::LpSolver(
+                "HiGHS warm solve failed".to_string(),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
+        consolidation::{consolidate_demand, consolidate_links},
         lp_builder::LpBuilderInput,
-        types::{ConsolidatedDemand, ConsolidatedLink},
+        types::{ConsolidatedDemand, ConsolidatedLink, Demand, Device, PrivateLink, PublicLink},
     };
+
+    /// Same sentinel as `shapley::ALWAYS_BIT`: bit for always-included operators.
+    const TEST_ALWAYS_BIT: u32 = 1 << 31;
+
+    /// A small 3-operator network: three parallel SRC→DST links owned by A, B, C
+    /// with different latencies and bandwidths, plus one demand that needs more
+    /// capacity than the cheapest link alone. This yields coalitions that are
+    /// infeasible (no/insufficient capacity) and feasible with distinct optima —
+    /// exactly the variety the warm/fresh equivalence check should cover.
+    fn three_op_network() -> (Vec<ConsolidatedLink>, Vec<ConsolidatedDemand>) {
+        let link = |op: &str, latency: f64, bandwidth: f64, shared: u32| ConsolidatedLink {
+            device1: "SRC".to_string(),
+            device2: "DST".to_string(),
+            latency,
+            bandwidth,
+            operator1: op.to_string(),
+            operator2: op.to_string(),
+            shared,
+            link_type: 0,
+        };
+        let links = vec![
+            link("A", 10.0, 10.0, 1),
+            link("B", 20.0, 10.0, 2),
+            link("C", 5.0, 3.0, 3), // cheapest but too small to carry the demand alone
+        ];
+        let demands = vec![ConsolidatedDemand {
+            start: "SRC".to_string(),
+            end: "DST".to_string(),
+            receivers: 1,
+            traffic: 5.0,
+            priority: 1.0,
+            kind: 1,
+            multicast: false,
+            original: 1,
+        }];
+        (links, demands)
+    }
+
+    /// Map an operator string to its coalition bit, mirroring `shapley.rs`.
+    fn operator_bit(op: &str, ordered_ops: &[&str]) -> u32 {
+        if op == "Public" || op == "Private" || op.is_empty() {
+            TEST_ALWAYS_BIT
+        } else {
+            ordered_ops
+                .iter()
+                .position(|o| *o == op)
+                .map(|idx| 1u32 << idx)
+                .unwrap_or(0)
+        }
+    }
+
+    /// The parity safety net: over *every* coalition of `links`/`demands`, the
+    /// warm-start solver must produce the identical coalition value as the
+    /// fresh-build `solve_coalition`. If any structural assumption behind
+    /// warm-start (e.g. a bandwidth or multicast row touching a column outside its
+    /// operators) were violated, this would fail.
+    fn assert_warm_matches_fresh(links: &[ConsolidatedLink], demands: &[ConsolidatedDemand]) {
+        let primitives = LpBuilderInput::new(links, demands)
+            .build()
+            .expect("LP build should succeed");
+        let precomputed = PrecomputedRows::new(&primitives);
+
+        // Derive operator order exactly as `compute_inner` does: sorted unique
+        // operators across all link endpoints, excluding the always-in sentinels.
+        let ordered_ops: Vec<String> = links
+            .iter()
+            .flat_map(|l| [l.operator1.clone(), l.operator2.clone()])
+            .filter(|o| o != "Public" && o != "Private" && !o.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let ops: Vec<&str> = ordered_ops.iter().map(String::as_str).collect();
+        let n_ops = ops.len();
+        assert!(
+            (1..=20).contains(&n_ops),
+            "unexpected operator count {n_ops}"
+        );
+
+        let mask_of =
+            |tags: &[String]| -> Vec<u32> { tags.iter().map(|s| operator_bit(s, &ops)).collect() };
+        let col_op1_mask = mask_of(&primitives.col_op1);
+        let col_op2_mask = mask_of(&primitives.col_op2);
+        let row_op1_mask = mask_of(&primitives.row_op1);
+        let row_op2_mask = mask_of(&primitives.row_op2);
+
+        let template = Arc::new(LpTemplate::from_primitives(&primitives));
+        let mut warm = WarmCoalitionSolver::from_template(1, template).expect("warm build");
+        let mut buf = CoalitionBuffers::new(primitives.cost.len());
+
+        // Map a solve result to the coalition value exactly as `compute_inner` does.
+        let to_value = |r: Result<CoalitionResult>| -> Option<f64> {
+            r.ok().and_then(|res| match res.status {
+                SolveStatus::Solved => Some(-res.objective_value),
+                SolveStatus::Infeasible => None,
+            })
+        };
+
+        let mut feasible_seen = 0;
+        for coalition_idx in 0..(1u32 << n_ops) {
+            let mask = coalition_idx | TEST_ALWAYS_BIT;
+
+            let fresh = to_value(solve_coalition(
+                &primitives,
+                &precomputed,
+                &mut buf,
+                mask,
+                &col_op1_mask,
+                &col_op2_mask,
+                &row_op1_mask,
+                &row_op2_mask,
+            ));
+            let warmed = to_value(warm.solve(mask, &col_op1_mask, &col_op2_mask));
+
+            match (fresh, warmed) {
+                (Some(f), Some(w)) => {
+                    feasible_seen += 1;
+                    assert!(
+                        (f - w).abs() < 1e-9,
+                        "coalition {coalition_idx:b}: fresh={f} warm={w}"
+                    );
+                }
+                (None, None) => {}
+                (f, w) => panic!(
+                    "coalition {coalition_idx:b}: feasibility differs fresh={f:?} warm={w:?}"
+                ),
+            }
+        }
+
+        assert!(
+            feasible_seen > 0,
+            "fixture produced no feasible coalitions — test is vacuous"
+        );
+    }
+
+    /// Parity over a unicast network with shared-bandwidth rows.
+    #[test]
+    fn warm_matches_fresh() {
+        let (links, demands) = three_op_network();
+        assert_warm_matches_fresh(&links, &demands);
+    }
+
+    /// Parity over a MULTICAST network — exercises the within-group constraint rows
+    /// and multicast auxiliary columns, the trickiest case for the "excluded
+    /// columns zero out their rows" argument. Built from the known-valid
+    /// `simple_test` fixture and consolidated exactly as `compute()` does.
+    #[test]
+    fn warm_matches_fresh_multicast() {
+        let private_links = vec![
+            PrivateLink::new("SIN1".into(), "FRA1".into(), 50.0, 10.0, 1.0, None),
+            PrivateLink::new("FRA1".into(), "AMS1".into(), 3.0, 10.0, 1.0, None),
+            PrivateLink::new("FRA1".into(), "LON1".into(), 5.0, 10.0, 1.0, None),
+        ];
+        let devices = vec![
+            Device::new("SIN1".into(), 1, "Alpha".into()),
+            Device::new("FRA1".into(), 1, "Alpha".into()),
+            Device::new("AMS1".into(), 1, "Beta".into()),
+            Device::new("LON1".into(), 1, "Beta".into()),
+        ];
+        let public_links = vec![
+            PublicLink::new("SIN".into(), "FRA".into(), 100.0),
+            PublicLink::new("SIN".into(), "AMS".into(), 102.0),
+            PublicLink::new("FRA".into(), "LON".into(), 7.0),
+            PublicLink::new("FRA".into(), "AMS".into(), 5.0),
+        ];
+        let demands = vec![
+            Demand::new("SIN".into(), "AMS".into(), 1, 1.0, 1.0, 1, true),
+            Demand::new("SIN".into(), "LON".into(), 5, 1.0, 2.0, 1, true),
+            Demand::new("AMS".into(), "LON".into(), 2, 3.0, 1.0, 2, false),
+            Demand::new("AMS".into(), "FRA".into(), 1, 3.0, 1.0, 2, false),
+        ];
+
+        let consolidated_demands = consolidate_demand(&demands, 1.0).expect("consolidate demand");
+        let consolidated_links = consolidate_links(
+            &private_links,
+            &devices,
+            &consolidated_demands,
+            &public_links,
+            5.0,
+        )
+        .expect("consolidate links");
+
+        assert_warm_matches_fresh(&consolidated_links, &consolidated_demands);
+    }
+
+    /// Re-solving the same coalition twice (the warm path) must be idempotent.
+    #[test]
+    fn warm_repeated_solve_is_stable() {
+        let (links, demands) = three_op_network();
+        let primitives = LpBuilderInput::new(&links, &demands).build().unwrap();
+        let ordered_ops = ["A", "B", "C"];
+        let col_op1_mask: Vec<u32> = primitives
+            .col_op1
+            .iter()
+            .map(|s| operator_bit(s, &ordered_ops))
+            .collect();
+        let col_op2_mask: Vec<u32> = primitives
+            .col_op2
+            .iter()
+            .map(|s| operator_bit(s, &ordered_ops))
+            .collect();
+
+        let template = Arc::new(LpTemplate::from_primitives(&primitives));
+        let mut warm = WarmCoalitionSolver::from_template(7, template).unwrap();
+        assert_eq!(warm.epoch(), 7);
+
+        // Grand coalition then back to a sub-coalition then grand again.
+        let grand = (1u32 << ordered_ops.len()) - 1 | TEST_ALWAYS_BIT;
+        let first = warm.solve(grand, &col_op1_mask, &col_op2_mask).unwrap();
+        let _ = warm.solve(0b001 | TEST_ALWAYS_BIT, &col_op1_mask, &col_op2_mask);
+        let again = warm.solve(grand, &col_op1_mask, &col_op2_mask).unwrap();
+        assert_eq!(first.status, again.status);
+        assert!((first.objective_value - again.objective_value).abs() < 1e-9);
+    }
 
     fn simple_links() -> Vec<ConsolidatedLink> {
         vec![ConsolidatedLink {

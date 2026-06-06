@@ -15,6 +15,11 @@ name = "csv_demand1"
 [[example]]
 name = "csv_demand2"
 
+[[bench]]
+name = "coalition"
+harness = false
+required-features = ["serde"]
+
 [dependencies]
 borsh = { version = "1", features = [ "derive" ] ,optional = true }
 csv = { version = "1", optional = true }
@@ -29,6 +34,7 @@ tabled = { version = "0", optional = true, features = [ "std" ]}
 thiserror = "2"
 
 [dev-dependencies]
+criterion = "0.5"
 csv = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
