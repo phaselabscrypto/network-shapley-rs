@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, fs::File, process::Command};
 use network_shapley::{
     error::ShapleyError,
     link_estimate::LinkEstimate,
-    shapley::ShapleyInput,
+    shapley::{ComputeControl, ShapleyInput},
     types::{Device, PrivateLink},
 };
 
@@ -45,6 +45,8 @@ fn fixture_input(demand_file: &str, operator_uptime: f64, multiplier: f64) -> Sh
 struct PyLink {
     device1: String,
     device2: String,
+    bandwidth: f64,
+    latency: f64,
     value: f64,
     percent: f64,
 }
@@ -75,12 +77,32 @@ fn run_python_link_estimate() -> Option<BTreeMap<String, Vec<PyLink>>> {
     Some(serde_json::from_str(&stdout).expect("Failed to parse Python JSON output"))
 }
 
-/// Index link rows by the canonical (device1, device2) pair for order-independent
-/// comparison (both sides emit one row per link in `device1 < device2` form).
-fn rust_by_pair(rows: &[LinkEstimate]) -> BTreeMap<(String, String), &LinkEstimate> {
-    rows.iter()
-        .map(|r| ((r.device1.clone(), r.device2.clone()), r))
-        .collect()
+/// Sort rows by (device pair, bandwidth, latency) for positional comparison.
+/// Parallel links — same device pair, different bandwidth/latency — are LEGAL
+/// input (only exact (pair, bandwidth, latency) duplicates are rejected), so a
+/// pair-only map key would silently collapse them. Cross-language float bit-keys
+/// would be fragile (pandas and Rust compute the uptime-adjusted bandwidth
+/// independently), so we order by value and compare fields within tolerances.
+fn sorted_rust(rows: &[LinkEstimate]) -> Vec<&LinkEstimate> {
+    let mut v: Vec<&LinkEstimate> = rows.iter().collect();
+    v.sort_by(|a, b| {
+        (a.device1.as_str(), a.device2.as_str())
+            .cmp(&(b.device1.as_str(), b.device2.as_str()))
+            .then(a.bandwidth.total_cmp(&b.bandwidth))
+            .then(a.latency.total_cmp(&b.latency))
+    });
+    v
+}
+
+fn sorted_python(rows: &[PyLink]) -> Vec<&PyLink> {
+    let mut v: Vec<&PyLink> = rows.iter().collect();
+    v.sort_by(|a, b| {
+        (a.device1.as_str(), a.device2.as_str())
+            .cmp(&(b.device1.as_str(), b.device2.as_str()))
+            .then(a.bandwidth.total_cmp(&b.bandwidth))
+            .then(a.latency.total_cmp(&b.latency))
+    });
+    v
 }
 
 fn compare(scenario: &str, rust: &[LinkEstimate], python: &[PyLink]) {
@@ -92,12 +114,28 @@ fn compare(scenario: &str, rust: &[LinkEstimate], python: &[PyLink]) {
         python.len()
     );
 
-    let by_pair = rust_by_pair(rust);
-    for py in python {
-        let key = (py.device1.clone(), py.device2.clone());
-        let rv = by_pair
-            .get(&key)
-            .unwrap_or_else(|| panic!("{scenario}: link {key:?} missing from Rust output"));
+    for (rv, py) in sorted_rust(rust).into_iter().zip(sorted_python(python)) {
+        let key = (py.device1.as_str(), py.device2.as_str());
+        assert_eq!(
+            (rv.device1.as_str(), rv.device2.as_str()),
+            key,
+            "{scenario}: row pairing mismatch after sort",
+        );
+        // Bandwidth/latency are part of the row identity (parallel links) — the
+        // uptime-adjusted bandwidth is computed independently on each side, so
+        // assert closeness, which also pins the consolidation parity.
+        assert!(
+            (rv.bandwidth - py.bandwidth).abs() < 1e-6,
+            "{scenario}: bandwidth mismatch for {key:?}: Rust={}, Python={}",
+            rv.bandwidth,
+            py.bandwidth,
+        );
+        assert!(
+            (rv.latency - py.latency).abs() < 1e-9,
+            "{scenario}: latency mismatch for {key:?}: Rust={}, Python={}",
+            rv.latency,
+            py.latency,
+        );
 
         let vdiff = (rv.value - py.value).abs();
         assert!(
@@ -159,11 +197,12 @@ fn test_link_estimate_ignores_operator_uptime() {
         .unwrap();
 
     assert_eq!(a.len(), b.len(), "link count differs across uptime inputs");
-    let bb = rust_by_pair(&b);
-    for ra in &a {
-        let rb = bb
-            .get(&(ra.device1.clone(), ra.device2.clone()))
-            .expect("link present in both");
+    for (ra, rb) in sorted_rust(&a).into_iter().zip(sorted_rust(&b)) {
+        assert_eq!(
+            (ra.device1.as_str(), ra.device2.as_str()),
+            (rb.device1.as_str(), rb.device2.as_str()),
+            "row pairing mismatch after sort",
+        );
         // Warm-start values are FP-stable, not bit-identical run-to-run, so use a
         // small tolerance (≪ any uptime-driven divergence).
         assert!(
@@ -219,5 +258,145 @@ fn test_link_estimate_too_many_operators() {
     assert!(
         matches!(err, ShapleyError::TooManyOperators { limit: 20, count } if count >= 21),
         "expected TooManyOperators{{limit:20}}, got {err:?}"
+    );
+}
+
+/// Minimal two-operator input for exercising the link-estimate pre-checks
+/// (which run BEFORE `check_inputs`, so demands/public links can stay empty).
+fn precheck_input(private_links: Vec<PrivateLink>) -> ShapleyInput {
+    ShapleyInput {
+        private_links,
+        devices: vec![
+            Device::new("AAA1".into(), 10, "Alpha".into()),
+            Device::new("BBB1".into(), 10, "Alpha".into()),
+            Device::new("CCC1".into(), 10, "Beta".into()),
+        ],
+        demands: Vec::new(),
+        public_links: Vec::new(),
+        operator_uptime: 1.0,
+        contiguity_bonus: 5.0,
+        demand_multiplier: 1.0,
+    }
+}
+
+fn expect_validation(input: ShapleyInput, focus: &str, needle: &str) {
+    let err = input
+        .network_link_estimate(focus)
+        .expect_err("pre-check must reject this input");
+    assert!(
+        matches!(&err, ShapleyError::Validation(msg) if msg.contains(needle)),
+        "expected Validation containing {needle:?}, got {err:?}"
+    );
+}
+
+/// Python pre-check parity (network_linkestimate.py:97-101): a shared-group id
+/// appearing on more than one focus-owned link is rejected.
+#[test]
+fn test_shared_group_on_focus_links_rejected() {
+    let input = precheck_input(vec![
+        PrivateLink::new("AAA1".into(), "BBB1".into(), 1.0, 10.0, 1.0, Some(7)),
+        PrivateLink::new("AAA1".into(), "CCC1".into(), 2.0, 10.0, 1.0, Some(7)),
+    ]);
+    expect_validation(input, "Alpha", "Shared groups");
+}
+
+/// Python pre-check parity (network_linkestimate.py:103-106): identical
+/// (unordered device pair, bandwidth, latency) links are rejected.
+#[test]
+fn test_duplicate_links_rejected() {
+    let input = precheck_input(vec![
+        PrivateLink::new("AAA1".into(), "BBB1".into(), 1.0, 10.0, 1.0, None),
+        PrivateLink::new("BBB1".into(), "AAA1".into(), 1.0, 10.0, 1.0, None),
+    ]);
+    expect_validation(input, "Alpha", "Duplicate links");
+}
+
+/// Signed-zero regression: pandas value-equality treats +0.0 and -0.0 bandwidth
+/// as duplicates, and so must the Rust key — otherwise the pair slips past the
+/// guard and confuses the `==`-based symmetric-pair match in retag_links.
+#[test]
+fn test_signed_zero_duplicate_links_rejected() {
+    let input = precheck_input(vec![
+        PrivateLink::new("AAA1".into(), "BBB1".into(), 1.0, 0.0, 1.0, None),
+        PrivateLink::new("AAA1".into(), "BBB1".into(), 1.0, -0.0, 1.0, None),
+    ]);
+    expect_validation(input, "Alpha", "Duplicate links");
+}
+
+/// A NaN latency makes the symmetric reverse row unfindable (`NaN != NaN`).
+/// Python raises IndexError there; the Rust port must fail loudly too, not
+/// silently half-tag the pair and return plausible-looking wrong values.
+/// (Only reachable via the direct crate API — serde_json/CSV reject NaN.)
+#[test]
+fn test_nan_latency_fails_loudly_instead_of_half_tagging() {
+    let mut input = fixture_input("tests/demand1.csv", 1.0, 1.0);
+    let alpha_link = input
+        .private_links
+        .iter_mut()
+        .find(|l| l.device1 == "AMS1" || l.device2 == "AMS1")
+        .expect("fixture has an Alpha-owned link");
+    alpha_link.latency = f64::NAN;
+
+    let err = input
+        .network_link_estimate("Alpha")
+        .expect_err("missing symmetric edge must be a loud error");
+    assert!(
+        matches!(&err, ShapleyError::Validation(msg) if msg.contains("no symmetric reverse link")),
+        "expected missing-sym Validation, got {err:?}"
+    );
+}
+
+/// The cancellable variant must produce the same values as the plain call and
+/// drive the progress counters (denominator = 2^players, fully consumed).
+#[test]
+fn test_cancellable_matches_plain_and_reports_progress() {
+    use std::sync::atomic::Ordering;
+
+    let control = ComputeControl::default();
+    let a = fixture_input("tests/demand1.csv", 1.0, 1.0)
+        .network_link_estimate_cancellable("Alpha", &control)
+        .expect("cancellable run failed");
+    let b = fixture_input("tests/demand1.csv", 1.0, 1.0)
+        .network_link_estimate("Alpha")
+        .expect("plain run failed");
+
+    assert_eq!(a.len(), b.len());
+    for (ra, rb) in sorted_rust(&a).into_iter().zip(sorted_rust(&b)) {
+        assert!(
+            (ra.value - rb.value).abs() < 1e-6,
+            "cancellable diverged for {}-{}: {} vs {}",
+            ra.device1,
+            ra.device2,
+            ra.value,
+            rb.value
+        );
+    }
+
+    let total = control.progress.max_samples.load(Ordering::Relaxed);
+    assert!(
+        total > 0 && total.is_power_of_two(),
+        "progress denominator should be 2^players, got {total}"
+    );
+    assert_eq!(
+        control.progress.coalitions_solved.load(Ordering::Relaxed),
+        total,
+        "every coalition should be counted as solved"
+    );
+}
+
+/// A pre-cancelled control aborts before any aggregation and surfaces as
+/// `ShapleyError::Cancelled` (the worker maps this to a cancelled job).
+#[test]
+fn test_pre_cancelled_control_returns_cancelled() {
+    use std::sync::atomic::Ordering;
+
+    let control = ComputeControl::default();
+    control.cancel.store(true, Ordering::Relaxed);
+    let err = fixture_input("tests/demand1.csv", 1.0, 1.0)
+        .network_link_estimate_cancellable("Alpha", &control)
+        .expect_err("pre-cancelled control must abort");
+    assert!(
+        matches!(err, ShapleyError::Cancelled),
+        "expected Cancelled, got {err:?}"
     );
 }

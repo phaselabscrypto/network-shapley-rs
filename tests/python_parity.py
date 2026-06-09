@@ -57,17 +57,33 @@ def run_scenario(demand_file: str, multiplier: float) -> dict:
     return {row["Operator"]: row["Value"] for _, row in result.iterrows()}
 
 
-def run_link_estimate(demand_file: str, focus: str, multiplier: float) -> list:
-    # `network_linkestimate.py` omits imports for helpers that live in
-    # `network_shapley` (`_assert`, `consolidate_*`, `lp_primitives`, `np`, ...).
-    # Inject them into its namespace so the reference module runs unmodified.
-    import network_shapley as _ns
-    import network_linkestimate as _nle
+def _load_network_linkestimate():
+    """Load the reference `network_linkestimate` with its missing imports pre-seeded.
 
+    The reference module omits imports for names it uses (`pd`, `np`, `_assert`,
+    `consolidate_*`, `lp_primitives`, ...) — they live in `network_shapley`. It
+    even ANNOTATES its defs with `pd.DataFrame`, and on Python <= 3.13
+    annotations are evaluated eagerly at def time, so a plain `import` raises
+    NameError before any post-import injection could run (PEP 649 defers this
+    only from 3.14). Pre-seed a fresh module namespace with network_shapley's
+    globals and exec the file body into it — works on every supported Python.
+    """
+    import importlib.util
+
+    import network_shapley as _ns
+
+    path = os.path.join(os.path.dirname(_ns.__file__), "network_linkestimate.py")
+    spec = importlib.util.spec_from_file_location("network_linkestimate", path)
+    mod = importlib.util.module_from_spec(spec)
     for _name in dir(_ns):
-        if not _name.startswith("__") and not hasattr(_nle, _name):
-            setattr(_nle, _name, getattr(_ns, _name))
-    from network_linkestimate import network_linkestimate
+        if not _name.startswith("__"):
+            setattr(mod, _name, getattr(_ns, _name))
+    spec.loader.exec_module(mod)
+    return mod.network_linkestimate
+
+
+def run_link_estimate(demand_file: str, focus: str, multiplier: float) -> list:
+    network_linkestimate = _load_network_linkestimate()
 
     devices = pd.read_csv(os.path.join(TEST_DIR, "devices.csv"))
     devices.columns = ["Device", "Edge", "Operator"]

@@ -110,7 +110,7 @@ impl ShapleyInput {
             &self.public_links,
             self.contiguity_bonus,
         )?;
-        retag_links(&mut full_map, operator_focus);
+        retag_links(&mut full_map, operator_focus)?;
 
         // Players = unique edge operators minus the always-in sentinels. "Others"
         // counts as a player (it can carry value), matching Python.
@@ -241,7 +241,7 @@ impl ShapleyInput {
             } else {
                 (l.device2.clone(), l.device1.clone())
             };
-            let key = (a, b, l.bandwidth.to_bits(), l.latency.to_bits());
+            let key = (a, b, float_key(l.bandwidth), float_key(l.latency));
             if !seen_links.insert(key) {
                 return Err(ShapleyError::Validation(
                     "Duplicate links found.".to_string(),
@@ -253,10 +253,27 @@ impl ShapleyInput {
     }
 }
 
+/// Key an `f64` for duplicate detection by VALUE equality, matching the Python
+/// reference (pandas `==`): `+0.0` and `-0.0` collapse to one key. Plain
+/// `to_bits` would let a signed-zero pair slip past the duplicate guard and
+/// then confuse the `==`-based symmetric-pair match in [`retag_links`]. NaN is
+/// unreachable via serde/CSV inputs, so bit-keying every other value is exact.
+fn float_key(x: f64) -> u64 {
+    (if x == 0.0 { 0.0f64 } else { x }).to_bits()
+}
+
 /// Retag operators so the coalition Shapley values per *link* of `operator_focus`.
 /// Faithful port of `network_linkestimate.py:retag_links` (lines 4–59), operating
 /// in place on the consolidated edge list (the analogue of the pandas `full_map`).
-fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) {
+///
+/// # Errors
+///
+/// Returns [`ShapleyError::Validation`] when a focus-owned link has no symmetric
+/// reverse edge. `consolidate_links` always emits the reverse twin with
+/// bit-identical floats, so a miss means a broken invariant (e.g. NaN smuggled
+/// in via the direct crate API). The Python reference raises `IndexError` here;
+/// silently half-tagging the pair would return plausible-looking wrong values.
+fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) -> Result<()> {
     // 1) Collapse every non-focus, non-public operator to "Others".
     for l in links.iter_mut() {
         if l.operator1 != "Public" && l.operator1 != operator_focus {
@@ -287,9 +304,14 @@ fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) {
             // uptime == 1.0 leaves the bandwidth penalty deterministic.
             let bw = links[idx].bandwidth;
             let lat = links[idx].latency;
-            let sym = links.iter().position(|l| {
+            let Some(s) = links.iter().position(|l| {
                 l.device1 == d2 && l.device2 == d1 && l.bandwidth == bw && l.latency == lat
-            });
+            }) else {
+                return Err(ShapleyError::Validation(format!(
+                    "no symmetric reverse link for {d1}->{d2} \
+                     (bandwidth {bw}, latency {lat})"
+                )));
+            };
 
             counter += 1;
             let tag_n = counter.to_string();
@@ -298,21 +320,15 @@ fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) {
             // assigns the same counter to all four operator slots.
             if links[idx].operator1 == operator_focus {
                 links[idx].operator1 = tag_n.clone();
-                if let Some(s) = sym {
-                    links[s].operator2 = tag_n.clone();
-                }
+                links[s].operator2 = tag_n.clone();
             }
             if links[idx].operator2 == operator_focus {
                 links[idx].operator2 = tag_n.clone();
-                if let Some(s) = sym {
-                    links[s].operator1 = tag_n.clone();
-                }
+                links[s].operator1 = tag_n.clone();
             }
 
             tag[idx] = false;
-            if let Some(s) = sym {
-                tag[s] = false;
-            }
+            tag[s] = false;
         } else {
             // Edge/ramp connection (a non-real-device endpoint): route through the
             // fixed "Private" pathway.
@@ -321,6 +337,8 @@ fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) {
             tag[idx] = false;
         }
     }
+
+    Ok(())
 }
 
 /// Match Python's real-device regex `^[A-Z]{3}([1-9][0-9]*|0[1-9])$`: exactly three
