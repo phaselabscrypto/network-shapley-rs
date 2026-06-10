@@ -284,6 +284,55 @@ pub(crate) fn solve_coalition(
     }
 }
 
+/// Per-LP wall-clock limit (seconds) for the warm-start path, overridable via
+/// `SHAPLEY_LP_TIME_LIMIT_SECS`. A typical coalition re-solve is ~100–200ms;
+/// the limit exists because dual simplex re-solving from a retained basis can
+/// degenerate-stall on rare coalitions and spin at 100% CPU indefinitely
+/// (observed at production scale: a 2048-coalition job stuck at 2046/2048 for
+/// 10+ minutes). On a timeout the coalition is retried COLD (fresh model,
+/// presolve on — the historically reliable configuration); if even the cold
+/// solve exceeds the limit, the computation fails LOUDLY rather than hanging
+/// or silently mis-valuing the coalition.
+pub(crate) fn lp_time_limit_secs() -> f64 {
+    static LIMIT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("SHAPLEY_LP_TIME_LIMIT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(60.0)
+    })
+}
+
+/// A column is active for a coalition iff BOTH its endpoint operators are in
+/// the mask — the single gate shared by the warm flip-loop and the cold
+/// rebuild (and, semantically, by the fresh-path [`solve_coalition`]).
+#[inline]
+fn column_active(coalition_mask: u32, op1_mask: u32, op2_mask: u32) -> bool {
+    (op1_mask & coalition_mask) != 0 && (op2_mask & coalition_mask) != 0
+}
+
+/// Map a TERMINAL (non-timeout) HiGHS status onto a coalition result.
+/// `ReachedTimeLimit` must be handled by the caller BEFORE this (warm → cold
+/// rescue; cold → hard error) — it is a control-flow signal, not a result.
+fn settle(status: highs::HighsModelStatus, objective_value: f64) -> Result<CoalitionResult> {
+    match status {
+        highs::HighsModelStatus::Optimal => Ok(CoalitionResult {
+            status: SolveStatus::Solved,
+            objective_value,
+        }),
+        highs::HighsModelStatus::Infeasible | highs::HighsModelStatus::UnboundedOrInfeasible => {
+            Ok(CoalitionResult {
+                status: SolveStatus::Infeasible,
+                objective_value: 0.0,
+            })
+        }
+        other => Err(ShapleyError::LpSolver(format!(
+            "HiGHS solver failed: {other:?}"
+        ))),
+    }
+}
+
 /// Full-size, coalition-independent description of the LP, built once per
 /// `compute()` and shared (via `Arc`) across rayon workers. Each worker turns it
 /// into its own persistent [`highs::Model`] for warm-started re-solving.
@@ -352,10 +401,14 @@ impl LpTemplate {
         //  - presolve=off: presolve would discard the basis between runs, which is
         //    exactly what we want to retain.
         //  - threads=1: one LP per rayon worker, no nested parallelism.
+        //  - time_limit: a stale-basis re-solve can degenerate-stall; bound it so
+        //    a pathological coalition triggers the cold-rescue path instead of
+        //    spinning forever (see `lp_time_limit_secs`).
         model.set_option("threads", 1_i32);
         model.set_option("solver", "simplex");
         model.set_option("simplex_strategy", 1_i32);
         model.set_option("presolve", "off");
+        model.set_option("time_limit", lp_time_limit_secs());
         model.make_quiet();
         Ok((model, vars))
     }
@@ -421,8 +474,7 @@ impl WarmCoalitionSolver {
         let n = self.vars.len();
         let mut active_count = 0usize;
         for i in 0..n {
-            let active =
-                (col_op1_mask[i] & coalition_mask) != 0 && (col_op2_mask[i] & coalition_mask) != 0;
+            let active = column_active(coalition_mask, col_op1_mask[i], col_op2_mask[i]);
             if active {
                 active_count += 1;
             }
@@ -453,27 +505,76 @@ impl WarmCoalitionSolver {
             Ok(solved) => {
                 let status = solved.status();
                 let objective_value = solved.objective_value();
-                self.model = Some(highs::Model::from(solved));
-                match status {
-                    highs::HighsModelStatus::Optimal => Ok(CoalitionResult {
-                        status: SolveStatus::Solved,
-                        objective_value,
-                    }),
-                    highs::HighsModelStatus::Infeasible
-                    | highs::HighsModelStatus::UnboundedOrInfeasible => Ok(CoalitionResult {
-                        status: SolveStatus::Infeasible,
-                        objective_value: 0.0,
-                    }),
-                    other => Err(ShapleyError::LpSolver(format!(
-                        "HiGHS solver failed: {:?}",
-                        other
-                    ))),
+                if status == highs::HighsModelStatus::ReachedTimeLimit {
+                    // Stale-basis degenerate stall (observed at production scale:
+                    // a single coalition spinning at 100% CPU for 10+ minutes).
+                    // Drop the poisoned model and retry this coalition COLD.
+                    eprintln!(
+                        "[shapley] warm solve hit the {}s time limit \
+                         (coalition {coalition_mask:#x}) — retrying cold",
+                        lp_time_limit_secs()
+                    );
+                    return self.solve_cold(coalition_mask, col_op1_mask, col_op2_mask);
                 }
+                self.model = Some(highs::Model::from(solved));
+                settle(status, objective_value)
             }
             // `try_solve` only errors on a structurally invalid model, which should
             // never happen here. Leave `model` None so the next call rebuilds.
             Err(_) => Err(ShapleyError::LpSolver(
                 "HiGHS warm solve failed".to_string(),
+            )),
+        }
+    }
+
+    /// Cold rescue for a coalition whose warm re-solve hit the time limit: build
+    /// a fresh model (no inherited basis) with presolve ON — the configuration
+    /// the pre-warm-start path ran reliably — and solve once. On success the
+    /// fresh model becomes the new warm model (presolve back off). A cold solve
+    /// that ALSO exceeds the limit is a hard error: callers must fail loudly,
+    /// never hang or silently mis-value the coalition.
+    fn solve_cold(
+        &mut self,
+        coalition_mask: u32,
+        col_op1_mask: &[u32],
+        col_op2_mask: &[u32],
+    ) -> Result<CoalitionResult> {
+        let (mut model, vars) = self.template.build_model()?;
+        model.set_option("presolve", "on");
+
+        let n = vars.len();
+        let mut col_active = vec![true; n];
+        for i in 0..n {
+            let active = column_active(coalition_mask, col_op1_mask[i], col_op2_mask[i]);
+            if !active {
+                model.change_column_bounds(vars[i], 0.0..=0.0);
+                col_active[i] = false;
+            }
+        }
+
+        match model.try_solve() {
+            Ok(solved) => {
+                let status = solved.status();
+                let objective_value = solved.objective_value();
+                if status == highs::HighsModelStatus::ReachedTimeLimit {
+                    return Err(ShapleyError::LpSolver(format!(
+                        "coalition LP exceeded the {}s time limit even on a \
+                         fresh solve (coalition mask {coalition_mask:#x})",
+                        lp_time_limit_secs()
+                    )));
+                }
+                let result = settle(status, objective_value)?;
+                // Adopt the fresh, optimally-based model as the new warm model
+                // (a `settle` error leaves `self.model` None → next call rebuilds).
+                let mut next = highs::Model::from(solved);
+                next.set_option("presolve", "off");
+                self.model = Some(next);
+                self.vars = vars;
+                self.col_active = col_active;
+                Ok(result)
+            }
+            Err(_) => Err(ShapleyError::LpSolver(
+                "HiGHS cold solve failed".to_string(),
             )),
         }
     }

@@ -23,7 +23,7 @@ use crate::{
         CoalitionBuffers, LpTemplate, PrecomputedRows, SolveStatus, WarmCoalitionSolver,
         solve_coalition,
     },
-    types::{Demands, Devices, PrivateLinks, PublicLinks},
+    types::{ConsolidatedDemand, ConsolidatedLink, Demands, Devices, PrivateLinks, PublicLinks},
     utils::factorial,
     validation::check_inputs,
 };
@@ -554,167 +554,19 @@ impl Shapley {
             self.contiguity_bonus,
         )?;
 
-        // Build LP primitives
-        let primitives = LpBuilderInput::new(&full_map, &full_demand).build()?;
-
-        // Build the full-size LP template once and share it across rayon workers.
-        // Each worker turns it into its own persistent HiGHS model and re-solves
-        // every coalition by toggling column bounds (warm-start), rather than
-        // rebuilding the model and re-running presolve per coalition.
-        let template = Arc::new(LpTemplate::from_primitives(&primitives));
-        let problem_epoch = next_problem_epoch();
-
-        // Pre-compute operator bitmasks (once, before the parallel loop)
-        let op_index: HashMap<&str, u8> = operators
-            .iter()
-            .enumerate()
-            .map(|(i, op)| (op.as_str(), i as u8))
-            .collect();
-
-        // B3 reuse gate (same rule as run_sampling): a coalition may take its
-        // value from `seed_cache` iff it excludes every changed operator. Empty
-        // when `changed_operators` is empty (no reuse).
-        let reuse_gate: u32 = changed_operators
-            .iter()
-            .filter_map(|op| op_index.get(op.as_str()).map(|&idx| 1u32 << idx))
-            .fold(0u32, |acc, b| acc | b);
-
-        let operator_mask = |op: &str| -> u32 {
-            if op == "Public" || op == "Private" || op.is_empty() {
-                ALWAYS_BIT
-            } else if let Some(&idx) = op_index.get(op) {
-                1u32 << idx
-            } else {
-                0
-            }
-        };
-
-        let col_op1_mask: Vec<u32> = primitives
-            .col_op1
-            .iter()
-            .map(|s| operator_mask(s))
-            .collect();
-        let col_op2_mask: Vec<u32> = primitives
-            .col_op2
-            .iter()
-            .map(|s| operator_mask(s))
-            .collect();
-        // Row (bandwidth) gating is unnecessary for the warm path: excluded columns
-        // are pinned to zero, so any row referencing only excluded columns collapses
-        // to `0 <= rhs`. (The fresh-build `solve_coalition` still gates rows; that
-        // path lives in `run_sampling`.)
-
-        let n_coalitions = 1 << n_operators;
-        let n_cols = col_op1_mask.len();
-        eprintln!(
-            "[shapley] LP dims: {} cols, {} eq-rows, {} ub-rows; {} operators, {} coalitions (exact)",
-            n_cols,
-            primitives.b_eq.len(),
-            primitives.b_ub.len(),
-            n_operators,
-            n_coalitions,
-        );
-
-        // Persists across calls: each rayon worker keeps its last-built HiGHS model
-        // until a new epoch replaces it (or the thread dies). That is `num_threads`
-        // resident models between computes — bounded, but heavier than the old
-        // `CoalitionBuffers`; the epoch check (re)builds lazily on next use.
-        thread_local! {
-            static WARM_SOLVER: RefCell<Option<WarmCoalitionSolver>> =
-                const { RefCell::new(None) };
-        }
-
-        // Solve LP for each coalition. When `control` is set, report per-coalition
-        // progress and honour cancellation exactly as the sampled path does (see
-        // `run_sampling`): the shared atomic counters let a caller running many of
-        // these in parallel (e.g. one exact solve per source city) aggregate a
-        // single smooth progress bar. With `control == None` this is a no-op, so
-        // `compute()` is byte-identical to before.
-        let coalition_values: Vec<Option<f64>> = (0..n_coalitions)
-            .into_par_iter()
-            .map(|coalition_idx| {
-                if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
-                    return None;
-                }
-
-                let coalition_mask = (coalition_idx as u32) | ALWAYS_BIT;
-
-                // B3 reuse: a coalition excluding every changed operator has an
-                // identical sub-LP (column gating), so its seeded value is exact.
-                if (coalition_idx as u32) & reuse_gate == 0
-                    && let Some(&seeded) = seed_cache.get(&coalition_mask)
-                {
-                    if let Some(c) = control {
-                        c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
-                        c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
-                    }
-                    return seeded;
-                }
-
-                let value = WARM_SOLVER.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-
-                    // Rebuild the thread-local solver if it is missing or was built
-                    // for a different problem (rayon workers persist across calls).
-                    let stale = slot.as_ref().is_none_or(|w| w.epoch() != problem_epoch);
-                    if stale {
-                        match WarmCoalitionSolver::from_template(problem_epoch, template.clone()) {
-                            Ok(w) => *slot = Some(w),
-                            Err(e) => {
-                                // A systemic build failure (not a normal infeasible
-                                // coalition) — surface it instead of silently
-                                // turning every coalition into `None`.
-                                eprintln!("[shapley] warm solver build failed: {e}");
-                                *slot = None;
-                                return None;
-                            }
-                        }
-                    }
-
-                    let solver = slot.as_mut().expect("warm solver present");
-                    match solver.solve(coalition_mask, &col_op1_mask, &col_op2_mask) {
-                        Ok(result) => {
-                            if matches!(result.status, SolveStatus::Solved) {
-                                Some(-result.objective_value) // Negative because we minimize
-                            } else {
-                                None // Infeasible coalition
-                            }
-                        }
-                        // Distinguish a hard solver error from a legitimately
-                        // infeasible coalition: both map to `None` (matching the
-                        // fresh path), but a real error must not pass silently.
-                        Err(e) => {
-                            eprintln!(
-                                "[shapley] coalition warm solve error (treated as infeasible): {e}"
-                            );
-                            None
-                        }
-                    }
-                });
-
-                if let Some(c) = control {
-                    c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
-                    c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
-                }
-                value
-            })
-            .collect();
-
-        // Cooperative cancellation: if requested mid-solve, stop before the
-        // (cheap) Shapley aggregation rather than return a partial result.
-        if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
-            return Err(ShapleyError::Cancelled);
-        }
-
-        // Compute expected values with operator uptime
-        let expected_values = if self.operator_uptime < 1.0 {
-            compute_expected_values(&coalition_values, n_operators, self.operator_uptime)?
-        } else {
-            coalition_values
-                .iter()
-                .map(|&v| v.unwrap_or(f64::NEG_INFINITY))
-                .collect()
-        };
+        // Solve every coalition's LP (warm-started) and fold operator uptime into
+        // the expected coalition values. This shared core also backs
+        // `network_link_estimate`, which drives the same coalition machinery over a
+        // retagged per-link operator map (see `link_estimate.rs`).
+        let expected_values = solve_coalitions_over_map(
+            &operators,
+            &full_map,
+            &full_demand,
+            self.operator_uptime,
+            seed_cache,
+            changed_operators,
+            control,
+        )?;
 
         // Compute Shapley values
         let shapley_values = compute_shapley_values(&expected_values, n_operators);
@@ -1190,6 +1042,191 @@ impl Shapley {
     }
 }
 
+/// Solve every coalition's LP over a consolidated link map and fold operator
+/// uptime into the expected coalition values — the shared warm-start core of the
+/// exact path.
+///
+/// `compute_inner` drives this with the device-derived operator set;
+/// `network_link_estimate` drives it with a retagged per-link operator set
+/// (pseudo-operators + `"Others"`). `operators` is the sorted player set, already
+/// excluding the `"Public"`/`"Private"` sentinels. Returns the length-`2^n`
+/// expected-value vector (n = `operators.len()`), ready for
+/// [`compute_shapley_values`].
+///
+/// Warm-start contract (see [`PROBLEM_EPOCH`]): this owns the rayon pool for the
+/// duration of its coalition loop, so callers must NOT run several of these
+/// concurrently on the same pool.
+pub(crate) fn solve_coalitions_over_map(
+    operators: &[String],
+    full_map: &[ConsolidatedLink],
+    full_demand: &[ConsolidatedDemand],
+    operator_uptime: f64,
+    seed_cache: HashMap<u32, Option<f64>>,
+    changed_operators: &[String],
+    control: Option<&ComputeControl>,
+) -> Result<Vec<f64>> {
+    let n_operators = operators.len();
+
+    // Build LP primitives
+    let primitives = LpBuilderInput::new(full_map, full_demand).build()?;
+
+    // Build the full-size LP template once and share it across rayon workers.
+    // Each worker turns it into its own persistent HiGHS model and re-solves
+    // every coalition by toggling column bounds (warm-start), rather than
+    // rebuilding the model and re-running presolve per coalition.
+    let template = Arc::new(LpTemplate::from_primitives(&primitives));
+    let problem_epoch = next_problem_epoch();
+
+    // Pre-compute operator bitmasks (once, before the parallel loop)
+    let op_index: HashMap<&str, u8> = operators
+        .iter()
+        .enumerate()
+        .map(|(i, op)| (op.as_str(), i as u8))
+        .collect();
+
+    // B3 reuse gate (same rule as run_sampling): a coalition may take its
+    // value from `seed_cache` iff it excludes every changed operator. Empty
+    // when `changed_operators` is empty (no reuse).
+    let reuse_gate: u32 = changed_operators
+        .iter()
+        .filter_map(|op| op_index.get(op.as_str()).map(|&idx| 1u32 << idx))
+        .fold(0u32, |acc, b| acc | b);
+
+    let operator_mask = |op: &str| -> u32 {
+        if op == "Public" || op == "Private" || op.is_empty() {
+            ALWAYS_BIT
+        } else if let Some(&idx) = op_index.get(op) {
+            1u32 << idx
+        } else {
+            0
+        }
+    };
+
+    let col_op1_mask: Vec<u32> = primitives
+        .col_op1
+        .iter()
+        .map(|s| operator_mask(s))
+        .collect();
+    let col_op2_mask: Vec<u32> = primitives
+        .col_op2
+        .iter()
+        .map(|s| operator_mask(s))
+        .collect();
+    // Row (bandwidth) gating is unnecessary for the warm path: excluded columns
+    // are pinned to zero, so any row referencing only excluded columns collapses
+    // to `0 <= rhs`. (The fresh-build `solve_coalition` still gates rows; that
+    // path lives in `run_sampling`.)
+
+    let n_coalitions = 1 << n_operators;
+    let n_cols = col_op1_mask.len();
+    eprintln!(
+        "[shapley] LP dims: {} cols, {} eq-rows, {} ub-rows; {} operators, {} coalitions (exact)",
+        n_cols,
+        primitives.b_eq.len(),
+        primitives.b_ub.len(),
+        n_operators,
+        n_coalitions,
+    );
+
+    // Persists across calls: each rayon worker keeps its last-built HiGHS model
+    // until a new epoch replaces it (or the thread dies). That is `num_threads`
+    // resident models between computes — bounded, but heavier than the old
+    // `CoalitionBuffers`; the epoch check (re)builds lazily on next use.
+    thread_local! {
+        static WARM_SOLVER: RefCell<Option<WarmCoalitionSolver>> =
+            const { RefCell::new(None) };
+    }
+
+    // Solve LP for each coalition. When `control` is set, report per-coalition
+    // progress and honour cancellation exactly as the sampled path does (see
+    // `run_sampling`): the shared atomic counters let a caller running many of
+    // these in parallel (e.g. one exact solve per source city) aggregate a
+    // single smooth progress bar. With `control == None` this is a no-op, so
+    // `compute()` is byte-identical to before.
+    let coalition_values: Vec<Option<f64>> = (0..n_coalitions)
+        .into_par_iter()
+        .map(|coalition_idx| -> Result<Option<f64>> {
+            if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
+                return Ok(None);
+            }
+
+            let coalition_mask = (coalition_idx as u32) | ALWAYS_BIT;
+
+            // B3 reuse: a coalition excluding every changed operator has an
+            // identical sub-LP (column gating), so its seeded value is exact.
+            if (coalition_idx as u32) & reuse_gate == 0
+                && let Some(&seeded) = seed_cache.get(&coalition_mask)
+            {
+                if let Some(c) = control {
+                    c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
+                    c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(seeded);
+            }
+
+            let value = WARM_SOLVER.with(|cell| -> Result<Option<f64>> {
+                let mut slot = cell.borrow_mut();
+
+                // Rebuild the thread-local solver if it is missing or was built
+                // for a different problem (rayon workers persist across calls).
+                let stale = slot.as_ref().is_none_or(|w| w.epoch() != problem_epoch);
+                if stale {
+                    match WarmCoalitionSolver::from_template(problem_epoch, template.clone()) {
+                        Ok(w) => *slot = Some(w),
+                        Err(e) => {
+                            // A systemic build failure — fail the computation
+                            // loudly rather than turning every coalition into a
+                            // silent `None`.
+                            *slot = None;
+                            return Err(e);
+                        }
+                    }
+                }
+
+                let solver = slot.as_mut().expect("warm solver present");
+                match solver.solve(coalition_mask, &col_op1_mask, &col_op2_mask) {
+                    Ok(result) => {
+                        if matches!(result.status, SolveStatus::Solved) {
+                            Ok(Some(-result.objective_value)) // Negative because we minimize
+                        } else {
+                            Ok(None) // Infeasible coalition
+                        }
+                    }
+                    // Hard solver errors (incl. a coalition exceeding the LP time
+                    // limit even after the cold rescue) FAIL the computation. The
+                    // old behaviour mapped these to `None` ("treated as
+                    // infeasible"), which silently corrupted Shapley values.
+                    Err(e) => Err(e),
+                }
+            })?;
+
+            if let Some(c) = control {
+                c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
+                c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<Option<f64>>>>()?;
+
+    // Cooperative cancellation: if requested mid-solve, stop before the
+    // (cheap) Shapley aggregation rather than return a partial result.
+    if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
+        return Err(ShapleyError::Cancelled);
+    }
+
+    // Compute expected values with operator uptime
+    let expected_values = if operator_uptime < 1.0 {
+        compute_expected_values(&coalition_values, n_operators, operator_uptime)?
+    } else {
+        coalition_values
+            .iter()
+            .map(|&v| v.unwrap_or(f64::NEG_INFINITY))
+            .collect()
+    };
+
+    Ok(expected_values)
+}
+
 /// Compute expected values considering operator uptime.
 ///
 /// For each coalition S, computes:
@@ -1245,7 +1282,7 @@ fn compute_expected_values(
 }
 
 /// Compute Shapley values from coalition values
-fn compute_shapley_values(coalition_values: &[f64], n_operators: usize) -> Vec<f64> {
+pub(crate) fn compute_shapley_values(coalition_values: &[f64], n_operators: usize) -> Vec<f64> {
     let mut shapley_values = vec![0.0; n_operators];
     let fact_n = factorial(n_operators);
 
