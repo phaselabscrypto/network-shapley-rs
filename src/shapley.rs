@@ -1145,9 +1145,9 @@ pub(crate) fn solve_coalitions_over_map(
     // `compute()` is byte-identical to before.
     let coalition_values: Vec<Option<f64>> = (0..n_coalitions)
         .into_par_iter()
-        .map(|coalition_idx| {
+        .map(|coalition_idx| -> Result<Option<f64>> {
             if control.is_some_and(|c| c.cancel.load(Ordering::Relaxed)) {
-                return None;
+                return Ok(None);
             }
 
             let coalition_mask = (coalition_idx as u32) | ALWAYS_BIT;
@@ -1161,10 +1161,10 @@ pub(crate) fn solve_coalitions_over_map(
                     c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
                     c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
                 }
-                return seeded;
+                return Ok(seeded);
             }
 
-            let value = WARM_SOLVER.with(|cell| {
+            let value = WARM_SOLVER.with(|cell| -> Result<Option<f64>> {
                 let mut slot = cell.borrow_mut();
 
                 // Rebuild the thread-local solver if it is missing or was built
@@ -1174,12 +1174,11 @@ pub(crate) fn solve_coalitions_over_map(
                     match WarmCoalitionSolver::from_template(problem_epoch, template.clone()) {
                         Ok(w) => *slot = Some(w),
                         Err(e) => {
-                            // A systemic build failure (not a normal infeasible
-                            // coalition) — surface it instead of silently
-                            // turning every coalition into `None`.
-                            eprintln!("[shapley] warm solver build failed: {e}");
+                            // A systemic build failure — fail the computation
+                            // loudly rather than turning every coalition into a
+                            // silent `None`.
                             *slot = None;
-                            return None;
+                            return Err(e);
                         }
                     }
                 }
@@ -1188,30 +1187,26 @@ pub(crate) fn solve_coalitions_over_map(
                 match solver.solve(coalition_mask, &col_op1_mask, &col_op2_mask) {
                     Ok(result) => {
                         if matches!(result.status, SolveStatus::Solved) {
-                            Some(-result.objective_value) // Negative because we minimize
+                            Ok(Some(-result.objective_value)) // Negative because we minimize
                         } else {
-                            None // Infeasible coalition
+                            Ok(None) // Infeasible coalition
                         }
                     }
-                    // Distinguish a hard solver error from a legitimately
-                    // infeasible coalition: both map to `None` (matching the
-                    // fresh path), but a real error must not pass silently.
-                    Err(e) => {
-                        eprintln!(
-                            "[shapley] coalition warm solve error (treated as infeasible): {e}"
-                        );
-                        None
-                    }
+                    // Hard solver errors (incl. a coalition exceeding the LP time
+                    // limit even after the cold rescue) FAIL the computation. The
+                    // old behaviour mapped these to `None` ("treated as
+                    // infeasible"), which silently corrupted Shapley values.
+                    Err(e) => Err(e),
                 }
-            });
+            })?;
 
             if let Some(c) = control {
                 c.progress.coalitions_solved.fetch_add(1, Ordering::Relaxed);
                 c.progress.batch_solved.fetch_add(1, Ordering::Relaxed);
             }
-            value
+            Ok(value)
         })
-        .collect();
+        .collect::<Result<Vec<Option<f64>>>>()?;
 
     // Cooperative cancellation: if requested mid-solve, stop before the
     // (cheap) Shapley aggregation rather than return a partial result.
