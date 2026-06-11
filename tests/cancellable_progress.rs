@@ -1,7 +1,7 @@
-//! Exact-path progress + cancellation (the additive `compute_cancellable` API).
+//! Exact-path progress + cancellation via `ComputeOptions`.
 //!
-//! Guards three properties of the new exact-path instrumentation:
-//!   1. `compute_cancellable(&ctrl)` returns BYTE-IDENTICAL output to `compute()`
+//! Guards three properties of the exact-path instrumentation:
+//!   1. `compute_with(opts)` with a control returns BYTE-IDENTICAL output to `compute()`
 //!      (the instrumentation must not change the math).
 //!   2. After a full run, `ctrl.progress.coalitions_solved == input.coalition_count()`
 //!      (so a caller can drive `solved / coalition_count` as a progress bar, and
@@ -10,7 +10,7 @@
 
 use network_shapley::{
     error::ShapleyError,
-    shapley::{ComputeControl, ShapleyInput},
+    shapley::{ComputeControl, ComputeOptions, ShapleyInput},
     types::{Demand, Device, PrivateLink, PublicLink},
 };
 use std::sync::atomic::Ordering;
@@ -62,14 +62,14 @@ fn cancellable_matches_plain_and_counts_coalitions() {
 
     let ctrl = ComputeControl::default();
     let cancellable = input
-        .compute_cancellable(&ctrl)
-        .expect("compute_cancellable");
+        .compute_with(ComputeOptions {
+            control: Some(Box::new(ctrl.clone())),
+            ..Default::default()
+        })
+        .expect("compute_with");
 
     // (1) byte-identical output — instrumentation didn't touch the math.
-    assert_eq!(
-        plain, cancellable,
-        "compute_cancellable must equal compute()"
-    );
+    assert_eq!(plain, cancellable, "compute_with must equal compute()");
 
     // (2) every coalition reported exactly once -> bar reaches 100%.
     assert_eq!(
@@ -89,7 +89,10 @@ fn pre_cancelled_returns_cancelled() {
     let input = small_input();
     let ctrl = ComputeControl::default();
     ctrl.cancel.store(true, Ordering::Relaxed);
-    match input.compute_cancellable(&ctrl) {
+    match input.compute_with(ComputeOptions {
+        control: Some(Box::new(ctrl)),
+        ..Default::default()
+    }) {
         Err(ShapleyError::Cancelled) => {}
         other => panic!("expected Cancelled, got {other:?}"),
     }

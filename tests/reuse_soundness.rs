@@ -1,7 +1,7 @@
 //! B3 soundness: topology-aware selective coalition reuse must produce values
 //! identical to a full fresh recompute on the modified topology.
 //!
-//! The core proof uses the EXACT path (`compute_with_reuse` vs `compute`), which
+//! The core proof uses the EXACT path (`compute_with` + reuse opts vs `compute`), which
 //! is deterministic — HiGHS solves the same LP to the same objective, so a reused
 //! coalition value (baseline solve of an unchanged sub-LP) is bit-comparable to a
 //! fresh solve. The sampled path is checked via the weaker but RNG-independent
@@ -15,7 +15,7 @@
 //! and would miss the real owner; see `shared_id_change_*`).
 
 use network_shapley::{
-    shapley::{SamplingConfig, ShapleyInput},
+    shapley::{ComputeOptions, SamplingConfig, ShapleyInput},
     types::{Demand, Device, PrivateLink, PublicLink},
 };
 use std::collections::HashMap;
@@ -122,8 +122,12 @@ fn d1_exact_reuse_equals_fresh() {
     assert!(!seed.is_empty(), "seed must be populated");
 
     let reuse = modified
-        .compute_with_reuse(seed, vec!["A".to_string()])
-        .expect("compute_with_reuse");
+        .compute_with(ComputeOptions {
+            seed_cache: seed,
+            changed_operators: vec!["A".to_string()],
+            ..Default::default()
+        })
+        .expect("compute_with reuse");
     let fresh = modified.compute().expect("compute");
 
     assert_outputs_eq(&reuse, &fresh, "d1_exact");
@@ -155,7 +159,14 @@ fn d1_sampled_common_masks_match_and_reuse_happens() {
     };
 
     let reuse = modified
-        .compute_sampled_with_reuse(cfg.clone(), seed, vec!["A".to_string()])
+        .compute_sampled_with(
+            cfg.clone(),
+            ComputeOptions {
+                seed_cache: seed,
+                changed_operators: vec!["A".to_string()],
+                ..Default::default()
+            },
+        )
         .expect("sampled reuse");
     let fresh = modified.compute_sampled(cfg).expect("sampled fresh");
 
@@ -196,8 +207,12 @@ fn d2_shared_id_change_reuse_equals_fresh() {
 
     let seed = baseline_cache(&baseline);
     let reuse = modified
-        .compute_with_reuse(seed, vec!["A".to_string()])
-        .expect("compute_with_reuse");
+        .compute_with(ComputeOptions {
+            seed_cache: seed,
+            changed_operators: vec!["A".to_string()],
+            ..Default::default()
+        })
+        .expect("compute_with reuse");
     let fresh = modified.compute().expect("compute");
     assert_outputs_eq(&reuse, &fresh, "d2_shared_id");
 }
@@ -214,8 +229,11 @@ fn d2_wrong_changed_set_diverges() {
     // Wrongly claim nothing changed ⇒ whole-cache reuse across topologies (the
     // C1 bug). A's coalitions get stale baseline values ⇒ A's value is wrong.
     let wrong = modified
-        .compute_with_reuse(seed, vec![]) // empty == reuse everything
-        .expect("compute_with_reuse wrong set");
+        .compute_with(ComputeOptions {
+            seed_cache: seed,
+            ..Default::default()
+        })
+        .expect("compute_with wrong set");
     let fresh = modified.compute().expect("compute");
 
     let diff = (wrong["A"].value - fresh["A"].value).abs();
@@ -231,8 +249,11 @@ fn d6_empty_set_same_topology_equals_fresh() {
     let input = topology(5.0, None, None);
     let seed = baseline_cache(&input);
     let reuse = input
-        .compute_with_reuse(seed, vec![])
-        .expect("compute_with_reuse");
+        .compute_with(ComputeOptions {
+            seed_cache: seed,
+            ..Default::default()
+        })
+        .expect("compute_with reuse");
     let fresh = input.compute().expect("compute");
     assert_outputs_eq(&reuse, &fresh, "d6_empty_same_topology");
 }
@@ -245,11 +266,12 @@ fn d7_all_changed_degrades_to_fresh() {
     let modified = topology(3.0, None, None);
     let seed = baseline_cache(&baseline);
     let reuse = modified
-        .compute_with_reuse(
-            seed,
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
-        )
-        .expect("compute_with_reuse");
+        .compute_with(ComputeOptions {
+            seed_cache: seed,
+            changed_operators: vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            ..Default::default()
+        })
+        .expect("compute_with reuse");
     let fresh = modified.compute().expect("compute");
     assert_outputs_eq(&reuse, &fresh, "d7_all_changed");
 }

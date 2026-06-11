@@ -24,6 +24,7 @@ required-features = ["serde"]
 borsh = { version = "1", features = [ "derive" ] ,optional = true }
 csv = { version = "1", optional = true }
 highs = "2.1"
+log = "0.4"
 rand = "0.9"
 rayon = "1"
 sprs = { version = "0.11.4", default-features = false }

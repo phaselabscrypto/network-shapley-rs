@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
+    constants::{CITY_PREFIX_LEN, OP_PUBLIC, PUBLIC_SWITCH_SUFFIX},
     error::{Result, ShapleyError},
     multicast::{
         build_j1_matrix, build_j2_matrix, compute_j1_minus_j2, extract_mcast_eligible_columns,
         hstack_matrices,
     },
-    sparse::CscMatrix,
+    sparse::{self, CscMatrix},
     types::{ConsolidatedDemand, ConsolidatedLink},
 };
 
@@ -25,26 +26,22 @@ impl<'a> LpBuilderInput<'a> {
     }
 
     /// Build LP problem using the new API
-    pub(crate) fn build(&self) -> Result<LpBuilderOutput> {
+    pub(crate) fn build(&self) -> Result<LpPrimitives> {
         let links = self.links;
         let demands = self.demands;
 
         // Count private links (non-public operators)
-        let n_private = links.iter().filter(|l| l.operator1 != "Public").count();
+        let n_private = links.iter().filter(|l| l.operator1 != OP_PUBLIC).count();
 
         // Identify multicast eligible/ineligible links
         let mcast_eligible: Vec<usize> = links
             .iter()
             .enumerate()
             .filter(|(_i, l)| {
-                // Python checks: ~(str[3:] == "00") & ~(str[3:] == "") & (op1 != "Public")
-                // This means: device2[3:] is not "00" AND device2[3:] is not empty
-                let device2_suffix = if l.device2.len() > 3 {
-                    &l.device2[3..]
-                } else {
-                    ""
-                };
-                device2_suffix != "00" && !device2_suffix.is_empty() && l.operator1 != "Public"
+                let device2_suffix = l.device2.get(CITY_PREFIX_LEN..).unwrap_or("");
+                device2_suffix != PUBLIC_SWITCH_SUFFIX
+                    && !device2_suffix.is_empty()
+                    && l.operator1 != OP_PUBLIC
             })
             .map(|(i, _)| i)
             .collect();
@@ -53,13 +50,9 @@ impl<'a> LpBuilderInput<'a> {
             .iter()
             .enumerate()
             .filter(|(_, l)| {
-                // Python checks: (str[3:] == "00") | (str[3:] == "") & (op1 != "Public")
-                let device2_suffix = if l.device2.len() > 3 {
-                    &l.device2[3..]
-                } else {
-                    ""
-                };
-                (device2_suffix == "00" || device2_suffix.is_empty()) && l.operator1 != "Public"
+                let device2_suffix = l.device2.get(CITY_PREFIX_LEN..).unwrap_or("");
+                (device2_suffix == PUBLIC_SWITCH_SUFFIX || device2_suffix.is_empty())
+                    && l.operator1 != OP_PUBLIC
             })
             .map(|(i, _)| i)
             .collect();
@@ -192,7 +185,7 @@ impl<'a> LpBuilderInput<'a> {
         // (+ multicast aux). `commodities` is dominated by multicast demands —
         // consolidate_demand() assigns a UNIQUE commodity type per multicast row —
         // so this is the lever that determines the whole problem scale.
-        eprintln!(
+        log::debug!(
             "[shapley] LP build: {} nodes, {} consolidated-links, {} commodities \
              ({} multicast groups, {} mcast-eligible links) -> {} cols (pre-keep)",
             n_nodes,
@@ -229,21 +222,21 @@ impl<'a> LpBuilderInput<'a> {
         let a_ub_final = filter_columns(&a_ub, &keep_final)?;
 
         // Build column operators
-        let col_op1 = build_column_operators1(
+        let col_op1 = build_column_operators(
             links,
             &commodities,
-            &multicast_commodities,
             &mcast_eligible,
             &keep_final,
             n_multicast_groups,
+            |l| &l.operator1,
         );
-        let col_op2 = build_column_operators2(
+        let col_op2 = build_column_operators(
             links,
             &commodities,
-            &multicast_commodities,
             &mcast_eligible,
             &keep_final,
             n_multicast_groups,
+            |l| &l.operator2,
         );
 
         // Build RHS vector for flow requirements
@@ -276,7 +269,7 @@ impl<'a> LpBuilderInput<'a> {
 
 /// Holds all components of the linear program
 #[derive(Debug)]
-pub(crate) struct LpBuilderOutput {
+pub(crate) struct LpPrimitives {
     pub a_eq: CscMatrix<f64>,
     pub a_ub: CscMatrix<f64>,
     pub b_eq: Vec<f64>,
@@ -287,9 +280,6 @@ pub(crate) struct LpBuilderOutput {
     pub col_op1: Vec<String>,
     pub col_op2: Vec<String>,
 }
-
-// Keep LpPrimitives as an alias for backward compatibility
-pub(crate) type LpPrimitives = LpBuilderOutput;
 
 /// Build single commodity flow conservation matrix
 fn build_single_commodity_matrix(
@@ -319,7 +309,7 @@ fn build_single_commodity_matrix(
     }
 
     // Build CSC matrix from triplets using clarabel's API
-    build_csc_from_triplets(&triplets, n_nodes, n_links)
+    sparse::from_triplets(&mut triplets, n_nodes, n_links)
 }
 
 /// Create block diagonal matrix from a single matrix repeated n times
@@ -469,52 +459,6 @@ fn build_bandwidth_constraints(
     Ok((i, b_ub, row_op1, row_op2))
 }
 
-/// Build CSC matrix from triplets
-fn build_csc_from_triplets(
-    triplets: &[(usize, usize, f64)],
-    n_rows: usize,
-    n_cols: usize,
-) -> Result<CscMatrix<f64>> {
-    if triplets.is_empty() {
-        return Ok(CscMatrix::new(
-            n_rows,
-            n_cols,
-            vec![0; n_cols + 1],
-            vec![],
-            vec![],
-        ));
-    }
-
-    // Sort triplets by column, then row
-    let mut sorted_triplets = triplets.to_vec();
-    sorted_triplets.sort_by_key(|&(r, c, _)| (c, r));
-
-    let mut col_ptr = vec![0];
-    let mut row_ind = Vec::new();
-    let mut values = Vec::new();
-
-    let mut current_col = 0;
-
-    for &(row, col, val) in &sorted_triplets {
-        // Fill in empty columns
-        while current_col < col {
-            col_ptr.push(row_ind.len());
-            current_col += 1;
-        }
-
-        row_ind.push(row);
-        values.push(val);
-    }
-
-    // Fill remaining columns
-    while current_col < n_cols {
-        col_ptr.push(row_ind.len());
-        current_col += 1;
-    }
-
-    Ok(CscMatrix::new(n_rows, n_cols, col_ptr, row_ind, values))
-}
-
 /// Vertically stack multiple CSC matrices. All matrices must have the same number of columns.
 fn vstack_matrices(matrices: &[&CscMatrix<f64>]) -> Result<CscMatrix<f64>> {
     if matrices.is_empty() {
@@ -625,7 +569,7 @@ fn build_within_group_constraints(
         }
     }
 
-    build_csc_from_triplets(&triplets, n_rows, n_total_cols)
+    sparse::from_triplets(&mut triplets, n_rows, n_total_cols)
 }
 
 /// Filter columns of a CSC matrix
@@ -661,70 +605,31 @@ fn filter_columns(matrix: &CscMatrix<f64>, keep: &[usize]) -> Result<CscMatrix<f
     ))
 }
 
-/// Build column operator tags for operator1
-fn build_column_operators1(
+/// Build column operator tags using the given field selector
+fn build_column_operators(
     links: &[ConsolidatedLink],
     commodities: &[u32],
-    _multicast_commodities: &[u32],
     mcast_eligible: &[usize],
     keep: &[usize],
     n_multicast_groups: usize,
+    select: impl Fn(&ConsolidatedLink) -> &str,
 ) -> Vec<String> {
     let mut col_op = Vec::new();
 
-    // Regular commodity columns
     for _ in commodities {
         for link in links {
-            col_op.push(link.operator1.clone());
+            col_op.push(select(link).to_string());
         }
     }
 
-    // Multicast auxiliary variable columns
     for _ in 0..n_multicast_groups {
         for &idx in mcast_eligible {
             if idx < links.len() {
-                col_op.push(links[idx].operator1.clone());
+                col_op.push(select(&links[idx]).to_string());
             }
         }
     }
 
-    // Filter by keep indices
-    let result: Vec<String> = keep
-        .iter()
-        .filter_map(|&i| col_op.get(i).cloned())
-        .collect();
-
-    result
-}
-
-/// Build column operator tags for operator2
-fn build_column_operators2(
-    links: &[ConsolidatedLink],
-    commodities: &[u32],
-    _multicast_commodities: &[u32],
-    mcast_eligible: &[usize],
-    keep: &[usize],
-    n_multicast_groups: usize,
-) -> Vec<String> {
-    let mut col_op = Vec::new();
-
-    // Regular commodity columns
-    for _ in commodities {
-        for link in links {
-            col_op.push(link.operator2.clone());
-        }
-    }
-
-    // Multicast auxiliary variable columns
-    for _ in 0..n_multicast_groups {
-        for &idx in mcast_eligible {
-            if idx < links.len() {
-                col_op.push(links[idx].operator2.clone());
-            }
-        }
-    }
-
-    // Filter by keep indices
     keep.iter()
         .filter_map(|&i| col_op.get(i).cloned())
         .collect()

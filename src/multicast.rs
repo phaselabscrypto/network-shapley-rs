@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     error::{Result, ShapleyError},
-    sparse::CscMatrix,
+    sparse::{self, CscMatrix},
     types::ConsolidatedLink,
 };
 
@@ -23,7 +23,7 @@ pub(crate) fn build_j1_matrix(
         }
     }
 
-    build_csc_from_triplets(&triplets, max_shared, n_links)
+    sparse::from_triplets(&mut triplets, max_shared, n_links)
 }
 
 /// Build J2 matrix - only multicast ineligible links grouped by shared ID
@@ -45,7 +45,7 @@ pub(crate) fn build_j2_matrix(
         }
     }
 
-    build_csc_from_triplets(&triplets, max_shared, n_links)
+    sparse::from_triplets(&mut triplets, max_shared, n_links)
 }
 
 /// Compute (J1 - J2) matrix for multicast constraints
@@ -78,12 +78,12 @@ pub(crate) fn compute_j1_minus_j2(
 
     // Remove near-zero entries and convert to triplets
     entries.retain(|_, v| v.abs() > 1e-10);
-    let triplets: Vec<(usize, usize, f64)> = entries
+    let mut triplets: Vec<(usize, usize, f64)> = entries
         .into_iter()
         .map(|((row, col), val)| (row, col, val))
         .collect();
 
-    build_csc_from_triplets(&triplets, j1.m, j1.n)
+    sparse::from_triplets(&mut triplets, j1.m, j1.n)
 }
 
 /// Extract columns from a matrix for multicast eligible links
@@ -120,52 +120,6 @@ pub(crate) fn extract_mcast_eligible_columns(
         row_ind,
         values,
     ))
-}
-
-/// Build CSC matrix from triplets (helper function)
-fn build_csc_from_triplets(
-    triplets: &[(usize, usize, f64)],
-    n_rows: usize,
-    n_cols: usize,
-) -> Result<CscMatrix<f64>> {
-    if triplets.is_empty() {
-        return Ok(CscMatrix::new(
-            n_rows,
-            n_cols,
-            vec![0; n_cols + 1],
-            vec![],
-            vec![],
-        ));
-    }
-
-    // Sort triplets by column, then row
-    let mut sorted_triplets = triplets.to_vec();
-    sorted_triplets.sort_by_key(|&(r, c, _)| (c, r));
-
-    let mut col_ptr = vec![0];
-    let mut row_ind = Vec::new();
-    let mut values = Vec::new();
-
-    let mut current_col = 0;
-
-    for &(row, col, val) in &sorted_triplets {
-        // Fill in empty columns
-        while current_col < col {
-            col_ptr.push(row_ind.len());
-            current_col += 1;
-        }
-
-        row_ind.push(row);
-        values.push(val);
-    }
-
-    // Fill remaining columns
-    while current_col < n_cols {
-        col_ptr.push(row_ind.len());
-        current_col += 1;
-    }
-
-    Ok(CscMatrix::new(n_rows, n_cols, col_ptr, row_ind, values))
 }
 
 /// Horizontally stack matrices

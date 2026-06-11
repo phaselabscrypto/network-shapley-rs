@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
+    constants::{self, OP_PUBLIC, PRIORITY_PRECISION, PUBLIC_SWITCH_SUFFIX},
     error::{Result, ShapleyError},
     types::{ConsolidatedDemand, ConsolidatedLink, Demands, Devices, PrivateLinks, PublicLinks},
 };
@@ -16,7 +17,7 @@ pub(crate) fn consolidate_demand(
     let mut groups: BTreeMap<(u32, String, i64), Vec<usize>> = BTreeMap::new();
 
     for (idx, demand) in demands.iter().enumerate() {
-        let priority_rounded = (demand.priority * 100.0).round() as i64;
+        let priority_rounded = (demand.priority * PRIORITY_PRECISION).round() as i64;
         let key = (demand.kind, demand.end.clone(), priority_rounded);
         groups.entry(key).or_default().push(idx);
     }
@@ -85,7 +86,7 @@ pub(crate) fn consolidate_demand(
         let mut priority_groups: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
 
         for &idx in &indices {
-            let priority_rounded = (consolidated[idx].priority * 100.0).round() as i64;
+            let priority_rounded = (consolidated[idx].priority * PRIORITY_PRECISION).round() as i64;
             priority_groups
                 .entry(priority_rounded)
                 .or_default()
@@ -156,7 +157,7 @@ pub(crate) fn consolidate_links(
     public_links: &PublicLinks,
     contiguity_bonus: f64,
 ) -> Result<Vec<ConsolidatedLink>> {
-    let mut consolidated = Vec::new();
+    let mut consolidated = Vec::with_capacity(private_links.len() * 3 + public_links.len() * 2);
 
     // Create device to operator mapping
     let device_to_operator: HashMap<&str, &str> = devices
@@ -189,19 +190,17 @@ pub(crate) fn consolidate_links(
 
     // Add forward direction
     for (link, shared_id) in &private_links_with_shared {
-        let operator1 = device_to_operator
+        let operator1 = *device_to_operator
             .get(link.device1.as_str())
-            .unwrap_or(&"Unknown");
-        let operator2 = device_to_operator
+            .ok_or_else(|| ShapleyError::MissingDevice(link.device1.clone()))?;
+        let operator2 = *device_to_operator
             .get(link.device2.as_str())
-            .unwrap_or(&"Unknown");
+            .ok_or_else(|| ShapleyError::MissingDevice(link.device2.clone()))?;
 
         // Adjust bandwidth using quadratic uptime penalty curve.
         // Maps raw uptime to effective availability — heavily penalizes below 98%:
         //   100% → 1.0, 99% → ~0.66, 98% → ~0, <98% → 0
-        let uptime_factor = (-1578.9474 * link.uptime.powi(2) + 3176.3158 * link.uptime
-            - 1596.3684)
-            .clamp(0.0, 1.0);
+        let uptime_factor = constants::uptime_penalty::factor(link.uptime);
         let adjusted_bandwidth = link.bandwidth * uptime_factor;
 
         consolidated.push(ConsolidatedLink {
@@ -264,24 +263,24 @@ pub(crate) fn consolidate_links(
     for link in public_links {
         // Forward direction
         public_links_consolidated.push(ConsolidatedLink {
-            device1: format!("{}00", link.city1),
-            device2: format!("{}00", link.city2),
+            device1: format!("{}{PUBLIC_SWITCH_SUFFIX}", link.city1),
+            device2: format!("{}{PUBLIC_SWITCH_SUFFIX}", link.city2),
             latency: link.latency,
             bandwidth: 0.0, // Public links have no bandwidth limit
-            operator1: "Public".to_string(),
-            operator2: "Public".to_string(),
+            operator1: OP_PUBLIC.to_string(),
+            operator2: OP_PUBLIC.to_string(),
             shared: 0,
             link_type: 0,
         });
 
         // Reverse direction
         public_links_consolidated.push(ConsolidatedLink {
-            device1: format!("{}00", link.city2),
-            device2: format!("{}00", link.city1),
+            device1: format!("{}{PUBLIC_SWITCH_SUFFIX}", link.city2),
+            device2: format!("{}{PUBLIC_SWITCH_SUFFIX}", link.city1),
             latency: link.latency,
             bandwidth: 0.0,
-            operator1: "Public".to_string(),
-            operator2: "Public".to_string(),
+            operator1: OP_PUBLIC.to_string(),
+            operator2: OP_PUBLIC.to_string(),
             shared: 0,
             link_type: 0,
         });
@@ -305,11 +304,11 @@ pub(crate) fn consolidate_links(
             // Public on-ramp for source
             public_links_consolidated.push(ConsolidatedLink {
                 device1: src.clone(),
-                device2: format!("{src}00"),
+                device2: format!("{src}{PUBLIC_SWITCH_SUFFIX}"),
                 latency: 0.0,
                 bandwidth: 0.0,
-                operator1: "Public".to_string(),
-                operator2: "Public".to_string(),
+                operator1: OP_PUBLIC.to_string(),
+                operator2: OP_PUBLIC.to_string(),
                 shared: 0,
                 link_type: type_id,
             });
@@ -317,12 +316,12 @@ pub(crate) fn consolidate_links(
             // Public off-ramps for destinations
             for dst in &destinations_vec {
                 public_links_consolidated.push(ConsolidatedLink {
-                    device1: format!("{dst}00"),
+                    device1: format!("{dst}{PUBLIC_SWITCH_SUFFIX}"),
                     device2: dst.to_string(),
                     latency: 0.0,
                     bandwidth: 0.0,
-                    operator1: "Public".to_string(),
-                    operator2: "Public".to_string(),
+                    operator1: OP_PUBLIC.to_string(),
+                    operator2: OP_PUBLIC.to_string(),
                     shared: 0,
                     link_type: type_id,
                 });
@@ -330,7 +329,8 @@ pub(crate) fn consolidate_links(
 
             // Private on-ramps for source city devices (inbound)
             for device in devices {
-                if device.device.starts_with(src) && !device.device.ends_with("00") {
+                if device.device.starts_with(src) && !device.device.ends_with(PUBLIC_SWITCH_SUFFIX)
+                {
                     // Use device's shared ID from mapping (inbound = false)
                     let shared_id = device_shared_map
                         .get(&(device.device.clone(), false))
@@ -352,7 +352,9 @@ pub(crate) fn consolidate_links(
             // Private off-ramps for destination city devices (outbound)
             for dst in &destinations_vec {
                 for device in devices {
-                    if device.device.starts_with(dst) && !device.device.ends_with("00") {
+                    if device.device.starts_with(dst)
+                        && !device.device.ends_with(PUBLIC_SWITCH_SUFFIX)
+                    {
                         // Use device's shared ID from mapping (outbound = true)
                         let shared_id = device_shared_map
                             .get(&(device.device.clone(), true))
@@ -376,7 +378,10 @@ pub(crate) fn consolidate_links(
     }
 
     // Add crossover points between private and public networks
-    let private_cities: HashSet<&str> = devices.iter().map(|d| &d.device[..3]).collect();
+    let private_cities: HashSet<&str> = devices
+        .iter()
+        .filter_map(|d| constants::city_prefix(&d.device))
+        .collect();
 
     let public_cities: HashSet<&str> = public_links
         .iter()
@@ -391,7 +396,7 @@ pub(crate) fn consolidate_links(
 
     for city in crossover_cities {
         for device in devices {
-            if device.device.starts_with(city) && !device.device.ends_with("00") {
+            if device.device.starts_with(city) && !device.device.ends_with(PUBLIC_SWITCH_SUFFIX) {
                 // Device to public (outbound)
                 let outbound_shared_id = device_shared_map
                     .get(&(device.device.clone(), true))
@@ -399,7 +404,7 @@ pub(crate) fn consolidate_links(
                     .ok_or_else(|| ShapleyError::MissingDevice(device.device.clone()))?;
                 consolidated.push(ConsolidatedLink {
                     device1: device.device.clone(),
-                    device2: format!("{city}00"),
+                    device2: format!("{city}{PUBLIC_SWITCH_SUFFIX}"),
                     latency: contiguity_bonus,
                     bandwidth: device.edge as f64,
                     operator1: device.operator.clone(),
@@ -414,7 +419,7 @@ pub(crate) fn consolidate_links(
                     .copied()
                     .ok_or_else(|| ShapleyError::MissingDevice(device.device.clone()))?;
                 consolidated.push(ConsolidatedLink {
-                    device1: format!("{city}00"),
+                    device1: format!("{city}{PUBLIC_SWITCH_SUFFIX}"),
                     device2: device.device.clone(),
                     latency: contiguity_bonus,
                     bandwidth: device.edge as f64,
