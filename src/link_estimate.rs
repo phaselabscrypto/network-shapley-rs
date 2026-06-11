@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     consolidation::{consolidate_demand, consolidate_links},
+    constants::{CITY_PREFIX_LEN, MAX_OPERATORS, OP_OTHERS, OP_PRIVATE, OP_PUBLIC},
     error::{Result, ShapleyError},
     shapley::{ComputeControl, ShapleyInput, compute_shapley_values, solve_coalitions_over_map},
     types::ConsolidatedLink,
@@ -34,11 +35,7 @@ use crate::{
 };
 
 /// Operator tags that never correspond to a focus link in the output.
-const DROP_TAGS: [&str; 3] = ["Public", "Private", "Others"];
-
-/// Maximum number of post-retag link-players (matches Python's
-/// `_assert(n_ops < 21)`): each adds a factor of 2 to the coalition enumeration.
-const MAX_OPERATORS: usize = 20;
+const DROP_TAGS: [&str; 3] = [OP_PUBLIC, OP_PRIVATE, OP_OTHERS];
 
 /// Per-link value-add for one focus operator. One row per focus-owned link, in the
 /// canonical `device1 < device2` orientation.
@@ -117,7 +114,7 @@ impl ShapleyInput {
         let mut operators: Vec<String> = full_map
             .iter()
             .flat_map(|l| [l.operator1.clone(), l.operator2.clone()])
-            .filter(|op| op != "Private" && op != "Public")
+            .filter(|op| op != OP_PRIVATE && op != OP_PUBLIC)
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -276,11 +273,11 @@ fn float_key(x: f64) -> u64 {
 fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) -> Result<()> {
     // 1) Collapse every non-focus, non-public operator to "Others".
     for l in links.iter_mut() {
-        if l.operator1 != "Public" && l.operator1 != operator_focus {
-            l.operator1 = "Others".to_string();
+        if l.operator1 != OP_PUBLIC && l.operator1 != operator_focus {
+            l.operator1 = OP_OTHERS.to_string();
         }
-        if l.operator2 != "Public" && l.operator2 != operator_focus {
-            l.operator2 = "Others".to_string();
+        if l.operator2 != OP_PUBLIC && l.operator2 != operator_focus {
+            l.operator2 = OP_OTHERS.to_string();
         }
     }
 
@@ -332,8 +329,8 @@ fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) -> Result<(
         } else {
             // Edge/ramp connection (a non-real-device endpoint): route through the
             // fixed "Private" pathway.
-            links[idx].operator1 = "Private".to_string();
-            links[idx].operator2 = "Private".to_string();
+            links[idx].operator1 = OP_PRIVATE.to_string();
+            links[idx].operator2 = OP_PRIVATE.to_string();
             tag[idx] = false;
         }
     }
@@ -347,14 +344,14 @@ fn retag_links(links: &mut [ConsolidatedLink], operator_focus: &str) -> Result<(
 /// consolidated helper nodes — public switches `"{city}00"` and bare cities
 /// `"{city}"` — which it rejects.
 fn is_real_device(s: &str) -> bool {
-    if !s.is_ascii() || s.len() < 4 {
+    if !s.is_ascii() || s.len() <= CITY_PREFIX_LEN {
         return false;
     }
     let bytes = s.as_bytes();
-    if !bytes[..3].iter().all(u8::is_ascii_uppercase) {
+    if !bytes[..CITY_PREFIX_LEN].iter().all(u8::is_ascii_uppercase) {
         return false;
     }
-    let suffix = &bytes[3..];
+    let suffix = &bytes[CITY_PREFIX_LEN..];
     if !suffix.iter().all(u8::is_ascii_digit) {
         return false;
     }

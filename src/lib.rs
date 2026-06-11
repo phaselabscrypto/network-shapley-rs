@@ -1,4 +1,5 @@
 pub(crate) mod consolidation;
+pub(crate) mod constants;
 pub mod error;
 pub mod link_estimate;
 pub(crate) mod lp_builder;

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    constants::DEFAULT_LP_TIME_LIMIT_SECS,
     error::{Result, ShapleyError},
     lp_builder::LpPrimitives,
     sparse::CscMatrix,
@@ -260,7 +261,7 @@ pub(crate) fn solve_coalition(
     //  - presolve=on: reduces ~1148-row constraint matrices significantly
     let mut model = pb
         .try_optimise(highs::Sense::Minimise)
-        .map_err(|_| ShapleyError::LpSolver("HiGHS model construction failed".to_string()))?;
+        .map_err(|e| ShapleyError::LpSolver(format!("HiGHS model construction failed: {e:?}")))?;
     model.set_option("threads", 1_i32);
     model.set_option("simplex_strategy", 1_i32);
     model.set_option("presolve", "on");
@@ -300,7 +301,7 @@ pub(crate) fn lp_time_limit_secs() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| *v > 0.0)
-            .unwrap_or(60.0)
+            .unwrap_or(DEFAULT_LP_TIME_LIMIT_SECS)
     })
 }
 
@@ -392,8 +393,8 @@ impl LpTemplate {
             pb.add_row(..=self.b_ub[row_idx], &entries);
         }
 
-        let mut model = pb.try_optimise(highs::Sense::Minimise).map_err(|_| {
-            ShapleyError::LpSolver("HiGHS warm model construction failed".to_string())
+        let mut model = pb.try_optimise(highs::Sense::Minimise).map_err(|e| {
+            ShapleyError::LpSolver(format!("HiGHS warm model construction failed: {e:?}"))
         })?;
         // Warm-start tuning:
         //  - solver=simplex + simplex_strategy=1 (dual): dual simplex restores
@@ -509,7 +510,7 @@ impl WarmCoalitionSolver {
                     // Stale-basis degenerate stall (observed at production scale:
                     // a single coalition spinning at 100% CPU for 10+ minutes).
                     // Drop the poisoned model and retry this coalition COLD.
-                    eprintln!(
+                    log::warn!(
                         "[shapley] warm solve hit the {}s time limit \
                          (coalition {coalition_mask:#x}) — retrying cold",
                         lp_time_limit_secs()
@@ -521,9 +522,9 @@ impl WarmCoalitionSolver {
             }
             // `try_solve` only errors on a structurally invalid model, which should
             // never happen here. Leave `model` None so the next call rebuilds.
-            Err(_) => Err(ShapleyError::LpSolver(
-                "HiGHS warm solve failed".to_string(),
-            )),
+            Err(e) => Err(ShapleyError::LpSolver(format!(
+                "HiGHS warm solve failed: {e:?}"
+            ))),
         }
     }
 
@@ -573,9 +574,9 @@ impl WarmCoalitionSolver {
                 self.col_active = col_active;
                 Ok(result)
             }
-            Err(_) => Err(ShapleyError::LpSolver(
-                "HiGHS cold solve failed".to_string(),
-            )),
+            Err(e) => Err(ShapleyError::LpSolver(format!(
+                "HiGHS cold solve failed: {e:?}"
+            ))),
         }
     }
 }
@@ -585,6 +586,7 @@ mod tests {
     use super::*;
     use crate::{
         consolidation::{consolidate_demand, consolidate_links},
+        constants::{OP_PRIVATE, OP_PUBLIC},
         lp_builder::LpBuilderInput,
         types::{ConsolidatedDemand, ConsolidatedLink, Demand, Device, PrivateLink, PublicLink},
     };
@@ -628,7 +630,7 @@ mod tests {
 
     /// Map an operator string to its coalition bit, mirroring `shapley.rs`.
     fn operator_bit(op: &str, ordered_ops: &[&str]) -> u32 {
-        if op == "Public" || op == "Private" || op.is_empty() {
+        if op == OP_PUBLIC || op == OP_PRIVATE || op.is_empty() {
             TEST_ALWAYS_BIT
         } else {
             ordered_ops
@@ -655,7 +657,7 @@ mod tests {
         let ordered_ops: Vec<String> = links
             .iter()
             .flat_map(|l| [l.operator1.clone(), l.operator2.clone()])
-            .filter(|o| o != "Public" && o != "Private" && !o.is_empty())
+            .filter(|o| o != OP_PUBLIC && o != OP_PRIVATE && !o.is_empty())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();

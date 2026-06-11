@@ -18,6 +18,12 @@ pub(crate) struct CscMatrix<T = f64> {
 
 impl<T: Clone> CscMatrix<T> {
     pub fn new(m: usize, n: usize, colptr: Vec<usize>, rowval: Vec<usize>, nzval: Vec<T>) -> Self {
+        debug_assert_eq!(colptr.len(), n + 1, "colptr length must be n + 1");
+        debug_assert_eq!(
+            rowval.len(),
+            nzval.len(),
+            "rowval and nzval must have equal length"
+        );
         Self {
             m,
             n,
@@ -31,6 +37,52 @@ impl<T: Clone> CscMatrix<T> {
     pub fn nnz(&self) -> usize {
         self.nzval.len()
     }
+}
+
+use crate::error::Result;
+
+/// Build a CSC matrix from (row, col, value) triplets, sorting in place.
+///
+/// The triplets slice is sorted by (col, row) as a side effect.
+pub(crate) fn from_triplets(
+    triplets: &mut [(usize, usize, f64)],
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<CscMatrix<f64>> {
+    if triplets.is_empty() {
+        return Ok(CscMatrix::new(
+            n_rows,
+            n_cols,
+            vec![0; n_cols + 1],
+            vec![],
+            vec![],
+        ));
+    }
+
+    triplets.sort_unstable_by_key(|&(r, c, _)| (c, r));
+
+    let mut col_ptr = vec![0];
+    let mut row_ind = Vec::with_capacity(triplets.len());
+    let mut values = Vec::with_capacity(triplets.len());
+
+    let mut current_col = 0;
+
+    for &(row, col, val) in triplets.iter() {
+        while current_col < col {
+            col_ptr.push(row_ind.len());
+            current_col += 1;
+        }
+
+        row_ind.push(row);
+        values.push(val);
+    }
+
+    while current_col < n_cols {
+        col_ptr.push(row_ind.len());
+        current_col += 1;
+    }
+
+    Ok(CscMatrix::new(n_rows, n_cols, col_ptr, row_ind, values))
 }
 
 /// Construct a dense-to-CSC matrix from a 2D array reference (test helper).

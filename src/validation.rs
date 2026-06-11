@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
+    constants::{OP_PRIVATE, OP_PUBLIC},
     error::{Result, ShapleyError},
     types::{Demands, Devices, PrivateLinks, PublicLinks},
     utils::has_digit,
@@ -16,7 +17,7 @@ pub(crate) fn check_inputs(
 ) -> Result<()> {
     // Check for "Public" operator name before filtering
     for device in devices {
-        if device.operator == "Public" {
+        if device.operator == OP_PUBLIC {
             return Err(ShapleyError::Validation(
                 "Public is a protected keyword for operator names; choose another.".to_string(),
             ));
@@ -27,7 +28,7 @@ pub(crate) fn check_inputs(
     let operators: HashSet<&str> = devices
         .iter()
         .map(|d| d.operator.as_str())
-        .filter(|&op| op != "Private" && op != "Public")
+        .filter(|&op| op != OP_PRIVATE && op != OP_PUBLIC)
         .collect();
 
     let n_ops = operators.len();
