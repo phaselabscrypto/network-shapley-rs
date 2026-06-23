@@ -17,7 +17,7 @@ use {
 
 use crate::{
     consolidation::{consolidate_demand, consolidate_links},
-    constants::{MAX_OPERATORS, OP_PRIVATE, OP_PUBLIC},
+    constants::{OP_PRIVATE, OP_PUBLIC},
     error::{Result, ShapleyError},
     lp_builder::LpBuilderInput,
     solver::{
@@ -26,7 +26,7 @@ use crate::{
     },
     types::{ConsolidatedDemand, ConsolidatedLink, Demands, Devices, PrivateLinks, PublicLinks},
     utils::factorial,
-    validation::check_inputs,
+    validation::{check_inputs, check_operator_limit},
 };
 
 /// Sentinel bit for operators that are always included in every coalition
@@ -174,7 +174,6 @@ impl ShapleyInput {
             &self.devices,
             &self.demands,
             &self.public_links,
-            self.operator_uptime,
         )?;
 
         let mut operators: Vec<String> = self
@@ -192,12 +191,7 @@ impl ShapleyInput {
             return Ok(ShapleyOutput::new());
         }
 
-        if n_operators > MAX_OPERATORS {
-            return Err(ShapleyError::TooManyOperators {
-                count: n_operators,
-                limit: MAX_OPERATORS,
-            });
-        }
+        check_operator_limit(n_operators, self.operator_uptime)?;
 
         // Consolidate demands and links
         let full_demand = consolidate_demand(&self.demands, self.demand_multiplier)?;
@@ -275,7 +269,6 @@ impl ShapleyInput {
             &self.devices,
             &self.demands,
             &self.public_links,
-            self.operator_uptime,
         )?;
 
         let mut operators: Vec<String> = self
@@ -300,12 +293,7 @@ impl ShapleyInput {
             });
         }
 
-        if n > MAX_OPERATORS {
-            return Err(ShapleyError::TooManyOperators {
-                count: n,
-                limit: MAX_OPERATORS,
-            });
-        }
+        check_operator_limit(n, self.operator_uptime)?;
 
         // Consolidate demands and links
         let full_demand = consolidate_demand(&self.demands, self.demand_multiplier)?;

@@ -16,8 +16,11 @@
 //!   pass is skipped).
 //! - link-ownership is OR semantics (a link is focus-owned iff *either* endpoint's
 //!   operator is the focus operator).
-//! - the same `< 21` player cap is enforced (both on raw operators, via
-//!   [`check_inputs`], and on the post-retag players).
+//! - unlike `compute()`, link estimation is NOT gated on the raw network-operator
+//!   count: every non-focus operator collapses to `"Others"`, so cost is driven by
+//!   the focus operator's link count. The post-retag player count is instead capped
+//!   at [`MAX_LINK_PLAYERS`] (31), the `u32` coalition-mask ceiling. This diverges
+//!   from the Python reference's `n_ops < 21` assert for >20 players.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -27,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     consolidation::{consolidate_demand, consolidate_links},
-    constants::{CITY_PREFIX_LEN, MAX_OPERATORS, OP_OTHERS, OP_PRIVATE, OP_PUBLIC},
+    constants::{CITY_PREFIX_LEN, MAX_LINK_PLAYERS, OP_OTHERS, OP_PRIVATE, OP_PUBLIC},
     error::{Result, ShapleyError},
     shapley::{ComputeControl, ShapleyInput, compute_shapley_values, solve_coalitions_over_map},
     types::ConsolidatedLink,
@@ -57,9 +60,10 @@ impl ShapleyInput {
     /// Per-link Shapley value-add for `operator_focus` (faithful port of Python
     /// `network_linkestimate`). See module docs.
     ///
-    /// Returns [`ShapleyError::TooManyOperators`] when the network has more than 20
-    /// operators, or when the focus operator resolves to more than 20 link-players
-    /// (both mirror the Python `n_ops < 21` asserts).
+    /// Returns [`ShapleyError::TooManyOperators`] when the focus operator resolves
+    /// to more than [`MAX_LINK_PLAYERS`] (31) link-players (the `u32` coalition-mask
+    /// ceiling). Unlike `compute()`, this is *not* gated on the raw network-operator
+    /// count, so a large network with a small focus operator is accepted.
     pub fn network_link_estimate(&self, operator_focus: &str) -> Result<Vec<LinkEstimate>> {
         self.link_estimate_inner(operator_focus, None)
     }
@@ -87,14 +91,16 @@ impl ShapleyInput {
         let operator_uptime = 1.0;
 
         // Python `network_linkestimate` pre-checks (network_linkestimate.py:97–106),
-        // ahead of the shared `check_inputs`.
+        // ahead of the shared `check_inputs`. Note: link estimation is deliberately
+        // NOT gated on the raw network-operator count — its cost depends on the
+        // focus operator's link count (the post-retag player cap below), not on how
+        // many operators the rest of the network has.
         self.check_link_estimate_inputs(operator_focus)?;
         check_inputs(
             &self.private_links,
             &self.devices,
             &self.demands,
             &self.public_links,
-            operator_uptime,
         )?;
 
         // Consolidate over the full demand set, then retag focus links as
@@ -120,10 +126,13 @@ impl ShapleyInput {
             .collect();
         operators.sort();
 
-        if operators.len() > MAX_OPERATORS {
+        // Cap the link-players at the u32 coalition-mask ceiling (bit 31 is the
+        // always-in sentinel, so players may only occupy bits 0..=30). Reuses the
+        // existing `TooManyOperators` error to avoid expanding the public enum.
+        if operators.len() > MAX_LINK_PLAYERS {
             return Err(ShapleyError::TooManyOperators {
                 count: operators.len(),
-                limit: MAX_OPERATORS,
+                limit: MAX_LINK_PLAYERS,
             });
         }
         if operators.is_empty() {

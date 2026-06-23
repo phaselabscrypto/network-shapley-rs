@@ -1,19 +1,51 @@
 use std::collections::HashSet;
 
 use crate::{
-    constants::{OP_PRIVATE, OP_PUBLIC},
+    constants::{MAX_OPERATORS, MAX_OPERATORS_PARTIAL_UPTIME, OP_PUBLIC},
     error::{Result, ShapleyError},
     types::{Demands, Devices, PrivateLinks, PublicLinks},
     utils::has_digit,
 };
 
-/// Validate all inputs for network shapley computation
+/// Validate that the operator count is within the coalition solver's limit.
+///
+/// The exact and sampled Shapley paths enumerate/sample over `2^n` coalitions, so
+/// the number of operators is capped. Partial uptime (`operator_uptime < 1.0`) runs
+/// the more expensive expectation pass and is held to the tighter
+/// [`MAX_OPERATORS_PARTIAL_UPTIME`]; full uptime is allowed up to [`MAX_OPERATORS`].
+///
+/// `n_operators` must already exclude the `Private`/`Public` sentinel operators.
+///
+/// # Errors
+///
+/// Returns [`ShapleyError::TooManyOperators`] when `n_operators` exceeds the limit
+/// for the given `operator_uptime`.
+pub(crate) fn check_operator_limit(n_operators: usize, operator_uptime: f64) -> Result<()> {
+    let limit = if operator_uptime < 1.0 {
+        MAX_OPERATORS_PARTIAL_UPTIME
+    } else {
+        MAX_OPERATORS
+    };
+    if n_operators > limit {
+        return Err(ShapleyError::TooManyOperators {
+            count: n_operators,
+            limit,
+        });
+    }
+    Ok(())
+}
+
+/// Validate the structural correctness of network shapley inputs.
+///
+/// This covers everything except the operator-count cap, which is enforced
+/// separately by [`check_operator_limit`] (the compute paths) so that
+/// `network_link_estimate` — whose cost depends on a focus operator's link count,
+/// not the raw network operator count — is not gated on the number of operators.
 pub(crate) fn check_inputs(
     private_links: &PrivateLinks,
     devices: &Devices,
     demands: &Demands,
     public_links: &PublicLinks,
-    operator_uptime: f64,
 ) -> Result<()> {
     // Check for "Public" operator name before filtering
     for device in devices {
@@ -22,28 +54,6 @@ pub(crate) fn check_inputs(
                 "Public is a protected keyword for operator names; choose another.".to_string(),
             ));
         }
-    }
-
-    // Check operator count (excluding "Private" and "Public")
-    let operators: HashSet<&str> = devices
-        .iter()
-        .map(|d| d.operator.as_str())
-        .filter(|&op| op != OP_PRIVATE && op != OP_PUBLIC)
-        .collect();
-
-    let n_ops = operators.len();
-    if operator_uptime < 1.0 {
-        if n_ops >= 16 {
-            return Err(ShapleyError::TooManyOperators {
-                count: n_ops,
-                limit: 15,
-            });
-        }
-    } else if n_ops >= 21 {
-        return Err(ShapleyError::TooManyOperators {
-            count: n_ops,
-            limit: 20,
-        });
     }
 
     // Check that private links table is labeled correctly
@@ -182,38 +192,32 @@ mod tests {
             false,
         )];
 
-        assert!(check_inputs(&private_links, &devices, &demands, &public_links, 1.0).is_ok());
+        assert!(check_inputs(&private_links, &devices, &demands, &public_links).is_ok());
     }
 
     #[test]
-    fn test_too_many_operators() {
-        let private_links = vec![PrivateLink::new(
-            "A1".to_string(),
-            "B1".to_string(),
-            50.0,
-            10.0,
-            1.0,
-            None,
-        )];
+    fn test_operator_limit_full_uptime() {
+        // At full uptime the cap is MAX_OPERATORS (20): 20 is fine, 21 is too many.
+        assert!(check_operator_limit(20, 1.0).is_ok());
+        assert!(matches!(
+            check_operator_limit(21, 1.0),
+            Err(ShapleyError::TooManyOperators {
+                count: 21,
+                limit: 20
+            })
+        ));
+    }
 
-        let mut devices = vec![];
-        for i in 0..25 {
-            devices.push(Device::new(format!("D{i}"), 1, format!("Op{i}")));
-        }
-
-        let public_links = vec![PublicLink::new("A".to_string(), "B".to_string(), 100.0)];
-
-        let demands = vec![Demand::new(
-            "A".to_string(),
-            "B".to_string(),
-            1,
-            1.0,
-            1.0,
-            1,
-            false,
-        )];
-
-        let result = check_inputs(&private_links, &devices, &demands, &public_links, 1.0);
-        assert!(matches!(result, Err(ShapleyError::TooManyOperators { .. })));
+    #[test]
+    fn test_operator_limit_partial_uptime() {
+        // Below full uptime the cap tightens to MAX_OPERATORS_PARTIAL_UPTIME (15).
+        assert!(check_operator_limit(15, 0.9).is_ok());
+        assert!(matches!(
+            check_operator_limit(16, 0.9),
+            Err(ShapleyError::TooManyOperators {
+                count: 16,
+                limit: 15
+            })
+        ));
     }
 }
