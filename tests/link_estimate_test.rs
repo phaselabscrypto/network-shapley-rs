@@ -226,24 +226,62 @@ fn test_link_estimate_unknown_focus_is_empty() {
     assert!(rows.is_empty(), "expected no links, got {rows:?}");
 }
 
-/// More than 20 operators trips the `n_ops < 21` cap (mirrors Python's assert;
-/// enforced via `check_inputs`). The post-retag player cap returns the identical
-/// `TooManyOperators` error.
+/// Link estimation is NOT gated on the raw network-operator count: cost depends on
+/// the focus operator's link count, not how many operators the rest of the network
+/// has (they all collapse to "Others"). A network with far more than 20 operators
+/// where the focus owns only a couple of links must be accepted — this used to be
+/// rejected with `TooManyOperators` via `check_inputs`.
 #[test]
-fn test_link_estimate_too_many_operators() {
-    let devices: Vec<Device> = (0..21)
-        .map(|i| Device::new(format!("DEV{i}"), 10, format!("Op{i}")))
-        .collect();
+fn test_link_estimate_allows_many_network_operators() {
+    // Focus owns 2 real-device links; 25 unrelated operators pad the network well
+    // past the old 20-operator cap (26 operators total).
+    let mut devices = vec![
+        Device::new("HUB1".into(), 10, "Focus".into()),
+        Device::new("LEG1".into(), 10, "Focus".into()),
+        Device::new("LEG2".into(), 10, "Focus".into()),
+    ];
+    for i in 0..25 {
+        devices.push(Device::new(format!("PAD{}", i + 1), 10, format!("Pad{i}")));
+    }
 
     let input = ShapleyInput {
-        private_links: vec![PrivateLink::new(
-            "DEV0".into(),
-            "DEV1".into(),
-            1.0,
-            10.0,
-            1.0,
-            None,
-        )],
+        private_links: vec![
+            PrivateLink::new("HUB1".into(), "LEG1".into(), 1.0, 10.0, 1.0, None),
+            PrivateLink::new("HUB1".into(), "LEG2".into(), 1.0, 10.0, 1.0, None),
+        ],
+        devices,
+        demands: Vec::new(),
+        public_links: Vec::new(),
+        operator_uptime: 1.0,
+        contiguity_bonus: 5.0,
+        demand_multiplier: 1.0,
+    };
+
+    let result = input.network_link_estimate("Focus");
+    assert!(
+        result.is_ok(),
+        "26-operator network must not be rejected for link estimation, got {result:?}"
+    );
+}
+
+/// The post-retag player count is capped at the `u32` coalition-mask ceiling
+/// (`MAX_LINK_PLAYERS` = 31): a focus operator owning more than 31 links exceeds
+/// what the mask can represent and is rejected (reusing `TooManyOperators`). The
+/// guard fires before the `2^n` solve, so this is cheap.
+#[test]
+fn test_link_estimate_too_many_link_players() {
+    // One hub plus 35 legs, all owned by the focus → 35 distinct intra-focus links
+    // → 35 link-players, over the limit of 31.
+    let mut devices = vec![Device::new("HUB1".into(), 10, "Focus".into())];
+    let mut private_links = Vec::new();
+    for i in 0..35 {
+        let leg = format!("LEG{}", i + 1);
+        devices.push(Device::new(leg.clone(), 10, "Focus".into()));
+        private_links.push(PrivateLink::new("HUB1".into(), leg, 1.0, 10.0, 1.0, None));
+    }
+
+    let input = ShapleyInput {
+        private_links,
         devices,
         demands: Vec::new(),
         public_links: Vec::new(),
@@ -253,11 +291,11 @@ fn test_link_estimate_too_many_operators() {
     };
 
     let err = input
-        .network_link_estimate("Op0")
-        .expect_err("21 operators must be rejected");
+        .network_link_estimate("Focus")
+        .expect_err("36 link-players must be rejected");
     assert!(
-        matches!(err, ShapleyError::TooManyOperators { limit: 20, count } if count >= 21),
-        "expected TooManyOperators{{limit:20}}, got {err:?}"
+        matches!(err, ShapleyError::TooManyOperators { limit: 31, count } if count >= 32),
+        "expected TooManyOperators{{limit:31}}, got {err:?}"
     );
 }
 

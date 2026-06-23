@@ -3,6 +3,18 @@
 /// Maximum operators the coalition solver supports (2^N coalitions).
 pub(crate) const MAX_OPERATORS: usize = 20;
 
+/// Tighter operator cap when `operator_uptime < 1.0`. The uptime expectation pass
+/// is more expensive than the plain coalition solve, so partial uptime is limited
+/// to fewer operators than the full-uptime [`MAX_OPERATORS`] case.
+pub(crate) const MAX_OPERATORS_PARTIAL_UPTIME: usize = 15;
+
+/// Maximum link-players for `network_link_estimate`. Coalition membership is a
+/// `u32` bitmask whose bit 31 is reserved as the always-in sentinel (`ALWAYS_BIT`
+/// in `shapley.rs`), so players may only occupy bits `0..=30` — 31 positions. This
+/// is the largest count representable without colliding with the sentinel bit;
+/// beyond it a player's bit would alias `ALWAYS_BIT` and silently corrupt values.
+pub(crate) const MAX_LINK_PLAYERS: usize = 31;
+
 /// Sentinel operator labels used in coalition membership.
 pub(crate) const OP_PUBLIC: &str = "Public";
 pub(crate) const OP_PRIVATE: &str = "Private";
