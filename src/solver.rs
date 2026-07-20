@@ -313,9 +313,13 @@ fn column_active(coalition_mask: u32, op1_mask: u32, op2_mask: u32) -> bool {
     (op1_mask & coalition_mask) != 0 && (op2_mask & coalition_mask) != 0
 }
 
-/// Map a TERMINAL (non-timeout) HiGHS status onto a coalition result.
-/// `ReachedTimeLimit` must be handled by the caller BEFORE this (warm → cold
-/// rescue; cold → hard error) — it is a control-flow signal, not a result.
+/// Map a TERMINAL HiGHS status onto a coalition result.
+/// `ReachedTimeLimit` and `Unknown` must be handled by the WARM caller BEFORE
+/// this (warm → cold rescue) — they are control-flow signals there, not
+/// results. On the COLD path only `ReachedTimeLimit` is pre-handled; a fresh
+/// presolve-on solve that still ends `Unknown` lands here as a hard error,
+/// deliberately: there is no cheaper configuration left to rescue with, and
+/// the computation must fail loudly rather than mis-value the coalition.
 fn settle(status: highs::HighsModelStatus, objective_value: f64) -> Result<CoalitionResult> {
     match status {
         highs::HighsModelStatus::Optimal => Ok(CoalitionResult {
@@ -506,14 +510,30 @@ impl WarmCoalitionSolver {
             Ok(solved) => {
                 let status = solved.status();
                 let objective_value = solved.objective_value();
+                // Two stale-basis pathologies get the cold rescue (observed at
+                // production scale):
+                //   - ReachedTimeLimit: degenerate stall — a single coalition
+                //     spinning at 100% CPU for 10+ minutes.
+                //   - Unknown: the re-solve terminates without a conclusive
+                //     status (numerical trouble on the inherited basis). This
+                //     previously fell through to `settle` as a hard error and
+                //     killed an entire per-city job at N% ("modified: city MUC:
+                //     LP solver error: HiGHS solver failed: Unknown").
+                // Either way the retained basis is poisoned: drop the model and
+                // retry this coalition COLD (fresh build, presolve on).
                 if status == highs::HighsModelStatus::ReachedTimeLimit {
-                    // Stale-basis degenerate stall (observed at production scale:
-                    // a single coalition spinning at 100% CPU for 10+ minutes).
-                    // Drop the poisoned model and retry this coalition COLD.
                     log::warn!(
                         "[shapley] warm solve hit the {}s time limit \
                          (coalition {coalition_mask:#x}) — retrying cold",
                         lp_time_limit_secs()
+                    );
+                    return self.solve_cold(coalition_mask, col_op1_mask, col_op2_mask);
+                }
+                if status == highs::HighsModelStatus::Unknown {
+                    log::warn!(
+                        "[shapley] warm solve ended inconclusive \
+                         (HighsModelStatus::Unknown, coalition {coalition_mask:#x}) \
+                         — retrying cold"
                     );
                     return self.solve_cold(coalition_mask, col_op1_mask, col_op2_mask);
                 }
@@ -528,12 +548,13 @@ impl WarmCoalitionSolver {
         }
     }
 
-    /// Cold rescue for a coalition whose warm re-solve hit the time limit: build
-    /// a fresh model (no inherited basis) with presolve ON — the configuration
-    /// the pre-warm-start path ran reliably — and solve once. On success the
-    /// fresh model becomes the new warm model (presolve back off). A cold solve
-    /// that ALSO exceeds the limit is a hard error: callers must fail loudly,
-    /// never hang or silently mis-value the coalition.
+    /// Cold rescue for a coalition whose warm re-solve hit the time limit or
+    /// ended without a conclusive status (`Unknown`): build a fresh model (no
+    /// inherited basis) with presolve ON — the configuration the pre-warm-start
+    /// path ran reliably — and solve once. On success the fresh model becomes
+    /// the new warm model (presolve back off). A cold solve that ALSO exceeds
+    /// the limit (or stays inconclusive, via `settle`) is a hard error: callers
+    /// must fail loudly, never hang or silently mis-value the coalition.
     fn solve_cold(
         &mut self,
         coalition_mask: u32,
@@ -593,6 +614,24 @@ mod tests {
 
     /// Same sentinel as `shapley::ALWAYS_BIT`: bit for always-included operators.
     const TEST_ALWAYS_BIT: u32 = 1 << 31;
+
+    /// Locks `settle`'s contract: `ReachedTimeLimit` and `Unknown` are hard
+    /// errors HERE, so the warm path must rescue them BEFORE calling settle
+    /// (see `WarmCoalitionSolver::solve`). If a refactor ever routes them into
+    /// settle expecting a result, this fails instead of mis-valuing coalitions.
+    #[test]
+    fn settle_maps_terminal_statuses() {
+        let solved = settle(highs::HighsModelStatus::Optimal, 42.0).unwrap();
+        assert!(matches!(solved.status, SolveStatus::Solved));
+        assert_eq!(solved.objective_value, 42.0);
+
+        let infeasible = settle(highs::HighsModelStatus::Infeasible, 7.0).unwrap();
+        assert!(matches!(infeasible.status, SolveStatus::Infeasible));
+        assert_eq!(infeasible.objective_value, 0.0);
+
+        assert!(settle(highs::HighsModelStatus::Unknown, 0.0).is_err());
+        assert!(settle(highs::HighsModelStatus::ReachedTimeLimit, 0.0).is_err());
+    }
 
     /// A small 3-operator network: three parallel SRC→DST links owned by A, B, C
     /// with different latencies and bandwidths, plus one demand that needs more
