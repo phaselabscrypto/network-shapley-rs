@@ -6,13 +6,16 @@ our way or a bug to report:
 
 - **Contributing Code**: If you have new code or a bug fix, fork this
   repo, create a logically-named branch, and [submit a PR against this
-  repo](https://github.com/doublezerofoundation/network-shapley-rs). Include a
+  repo](https://github.com/phaselabscrypto/network-shapley-rs). Include a
   write up of the PR with details on what it does.
 
 - **Reporting Bugs**: Open an issue [against this
-  repo](https://github.com/doublezerofoundation/network-shapley-rs/issues) with as
+  repo](https://github.com/phaselabscrypto/network-shapley-rs/issues) with as
   much detail as you can. At the very least you'll include steps to
   reproduce the problem.
+
+A change that is not specific to this fork belongs upstream, at
+[doublezerofoundation/network-shapley-rs](https://github.com/doublezerofoundation/network-shapley-rs).
 
 This project is intended to be a safe, welcoming space for
 collaboration, and contributors are expected to adhere to the

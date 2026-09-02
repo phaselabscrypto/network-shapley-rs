@@ -5,7 +5,7 @@
 //! repo accessible (see tests/python_parity.py for search paths).
 //!
 //! Run with: cargo test --features serde --test python_parity_test
-//! Skip with: cargo test --test python_parity_test -- --ignored (if Python unavailable)
+//! The test SKIPs (passes) when Python or its deps are unavailable.
 
 use std::{collections::BTreeMap, fs::File, process::Command};
 
