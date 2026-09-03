@@ -2,6 +2,10 @@
 name = "network-shapley"
 version = "0.3.0"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/phaselabscrypto/network-shapley-rs"
+description = "Rust implementation of network-shapley: Shapley value attribution for network operators."
+readme = "README.md"
 
 [[bin]]
 name = "shapley-cli"

@@ -1,14 +1,76 @@
 # Network Shapley
 
-[![CI](https://github.com/doublezerofoundation/network-shapley-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/doublezerofoundation/network-shapley-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/phaselabscrypto/network-shapley-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/phaselabscrypto/network-shapley-rs/actions/workflows/ci.yml)
 
-[![codecov](https://codecov.io/github/doublezerofoundation/network-shapley-rs/graph/badge.svg?token=S3QVQV7CFJ)](https://codecov.io/github/doublezerofoundation/network-shapley-rs)
+## About this fork
+
+### What this is
+
+This is a public fork of [doublezerofoundation/network-shapley-rs](https://github.com/doublezerofoundation/network-shapley-rs). Phase maintains it for the DZ Contributor Rewards app. The base is upstream `v0.6.0` (commit `cc85bca`). This fork adds 12 commits in 7 pull requests on top of that base.
+
+### What it adds
+
+- `#1`: Replaces the hand-written simplex with HiGHS (`highs = "2.1"`) and removes `microlp`. Adds Monte Carlo permutation sampling through `compute_sampled`, with a running standard error and adaptive batch sizes. Adds cancellation and progress counters through `ComputeControl` and `ShapleyError::Cancelled`. Adds seed-cache (B3) reuse.
+- `#2`: Adds progress counters to the exact compute path. Adds `coalition_count()`.
+- `#3`: Warm-starts the exact coalition solve through a crate-private `WarmCoalitionSolver`. This runs about 3 times faster than the prior cold solve.
+- `#4`: Adds `network_link_estimate` for a per-link Shapley estimate. Each focus-owned link becomes its own player. Every other operator collapses to `Others`. Uptime is forced to 1.0. It runs one exact solve over `2^(links+1)` coalitions.
+- `#5`: Consolidates the API onto `ComputeOptions`. Adds a constants module. Adds a sparse-matrix helper.
+- `#6`: Exempts link estimation from the operator cap. Adds `MAX_LINK_PLAYERS = 31`, a `u32` mask with bit 31 reserved. Adds `MAX_OPERATORS_PARTIAL_UPTIME = 15`.
+- `#7`: Adds a cold retry for when HiGHS returns `Unknown` on a warm solve.
+
+### Public API
+
+`src/lib.rs` exports four public modules: `error`, `link_estimate`, `shapley`, `types`. Nothing is re-exported at the crate root.
+
+`ShapleyInput::compute` runs the exact Shapley computation. `compute_with` takes a `ComputeOptions` for cancellation, progress, and coalition reuse. `compute_sampled` runs Monte Carlo permutation sampling with a `SamplingConfig`. `compute_sampled_with` combines sampling with `ComputeOptions`. `coalition_count` returns the number of coalitions the exact path solves.
+
+`ShapleyInput::network_link_estimate` returns a per-link Shapley estimate for one `operator_focus`. `network_link_estimate_cancellable` takes the same arguments plus a `ComputeControl`.
+
+Supporting types: `ComputeControl` holds `cancel: Arc<AtomicBool>` and `progress: Arc<ComputeProgress>`. `ComputeProgress` holds six atomic counters and a `reset()` method. `SamplingConfig` defaults to `min_samples: 100`, `max_samples: 500`, `target_se: 0.05`, `batch_size: 50`, and offers `for_problem` and `for_simulation` constructors. `SampledOutput` carries a sampled result with its convergence diagnostics. `LinkEstimate` carries one focus-owned link's Shapley value. `ShapleyError` covers solver and validation failures, including `Cancelled`, `TooManyOperators`, and `LpSolver`.
+
+### Limits
+
+| Limit | Value | Applies when |
+|---|---|---|
+| Operators at full uptime | 20 | `operator_uptime >= 1.0` |
+| Operators at partial uptime | 15 | `operator_uptime < 1.0` |
+| Link-estimation players | 31 | always; `u32` coalition mask, bit 31 reserved |
+| LP time limit | 60 seconds | default; set `SHAPLEY_LP_TIME_LIMIT_SECS` to override |
+
+These limits live in crate-private constants: `MAX_OPERATORS`, `MAX_OPERATORS_PARTIAL_UPTIME`, `MAX_LINK_PLAYERS`, and `DEFAULT_LP_TIME_LIMIT_SECS`. Code outside the crate reaches them only through a `TooManyOperators` error, an `LpSolver` error, or the `SHAPLEY_LP_TIME_LIMIT_SECS` environment variable.
+
+### CLI and features
+
+The crate defines three features: `serde`, `borsh`, `cli`. None is a default feature.
+
+The `shapley-cli` binary needs `--features cli`. It reads a `ShapleyInput` as JSON on stdin, runs `compute()`, and prints a JSON array of `{operator, value, proportion}` objects.
+
+The `coalition` bench needs `--features serde`.
+
+Three examples ship in `examples/`: `simple`, `csv_demand1`, `csv_demand2`.
+
+### Tests
+
+- `cancellable_progress.rs`: Exact-path cancellation and progress counters do not change the computed values.
+- `csv_test.rs`: The CSV demand1 and demand2 fixtures produce the expected `compute()` output.
+- `json_roundtrip.rs`: JSON serialization round-trips. Shared and multicast fields parse leniently.
+- `link_estimate_test.rs`: Checks `network_link_estimate` against the Python `network_linkestimate` reference, plus edge cases.
+- `lp_time_limit.rs`: A too-low LP time limit fails with `LpSolver`, not a hang.
+- `python_parity_test.rs`: Checks `compute()` against the Python `network_shapley` reference over CSV fixtures.
+- `reuse_soundness.rs`: B3 coalition reuse matches a fresh recompute.
+- `simple_test.rs`: The simple example matches the Python reference's `simple_example.py` output.
+- `telemetry_device_validation.rs`: Testnet, devnet, mixed-format, and digit-free device names all pass validation.
+- `validation_errors.rs`: Invalid inputs, including too many operators and unreachable demand nodes, fail validation.
+
+`python_parity_test.rs` and `link_estimate_test.rs` run the Python reference through `tests/python_parity.py`. Both print `SKIP` and pass when `python3`, `pandas`, or `scipy` is unavailable. Set `NETWORK_SHAPLEY_PY_PATH` to the `network-shapley` checkout so `tests/python_parity.py` can find it.
+
+HiGHS computes the results. Upstream `v0.6.0` used a hand-written simplex. A warm-started solve is stable to floating-point rounding but is not bit-identical run to run (see the comment near the top of `src/shapley.rs`).
 
 Rust implementation to match Python [network-shapley](https://github.com/doublezerofoundation/network-shapley).
 
 ## Prerequisites
 
-- Rust (stable, tested with 1.87.0)
+- Rust (stable, tested with 1.90)
 - [Just](https://github.com/casey/just) (alternative to `make`)
 
 ## Local Development
